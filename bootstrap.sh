@@ -6,9 +6,9 @@ cd "$(dirname "$0")"
 
 if [ "${1:-}" = "diff" ]; then
   rc=0
-  for f in flow-mic/bin/flow-mic-*; do
+  for f in */bin/*; do
     dest="$HOME/.local/bin/$(basename "$f")"
-    diff -u "$dest" "$f" || rc=1
+    diff -uN "$dest" "$f" || rc=1
   done
   PLIST="$HOME/Library/LaunchAgents/com.toolbelt.flow-mic-daemon.plist"
   sed "s|__HOME__|$HOME|g" flow-mic/launchd/com.toolbelt.flow-mic-daemon.plist.template | diff -u "$PLIST" - || rc=1
