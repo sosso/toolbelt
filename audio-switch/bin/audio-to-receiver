@@ -1,0 +1,5 @@
+#!/bin/bash
+# Switch audio output to the Music Receiver bluetooth speaker.
+# Companion to audio-to-speakers, for plugging back into power.
+
+/opt/homebrew/bin/SwitchAudioSource -s "Music Receiver"

@@ -7,6 +7,7 @@ Small macOS utilities, each in its own directory with an `install.sh`.
 | [`micctl`](micctl/) | CLI for Core Audio input devices: get/set hardware mute and volume, check whether a device is recording. Reaches the device-level controls AppleScript can't. |
 | [`keysend`](keysend/) | Synthesizes a keyboard chord with *real* modifier keydown/keyup events (the way hardware does it), for apps whose shortcut listeners ignore flags-only synthetic events. |
 | [`flow-mic`](flow-mic/) | launchd daemon that saves/restores a mic's hardware mute state around Wispr Flow dictations: unmutes when recording starts, restores your previous state when it stops. |
+| [`audio-switch`](audio-switch/) | Output-device switching scripts (receiver ↔ built-in speakers) with silent applet wrappers for Stream Deck dock/undock multi-actions. |
 
 ## Install
 

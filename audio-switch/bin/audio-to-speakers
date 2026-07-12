@@ -1,0 +1,5 @@
+#!/bin/bash
+# Switch audio output to the MacBook's built-in speakers.
+# Used in a Stream Deck multi-action when disconnecting from power.
+
+/opt/homebrew/bin/SwitchAudioSource -s "MacBook Pro Speakers"

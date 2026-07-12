@@ -22,5 +22,10 @@ xcode-select -p >/dev/null 2>&1 || { echo "Xcode Command Line Tools required (xc
 ./micctl/install.sh
 ./keysend/install.sh
 ./flow-mic/install.sh
+if [ -x /opt/homebrew/bin/SwitchAudioSource ]; then
+  ./audio-switch/install.sh
+else
+  echo "audio-switch skipped (brew install switchaudio-osx to enable)"
+fi
 
 echo "toolbelt applied."
