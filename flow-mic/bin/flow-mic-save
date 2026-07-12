@@ -1,0 +1,10 @@
+#!/bin/bash
+# Snapshot mic mute state before Wispr Flow dictation; flow-mic-restore reads it back.
+MICCTL="$HOME/.local/bin/micctl"
+STATE="$HOME/.local/state/wispr-mic-state"
+: > "$STATE"
+# MOTIV Mix Virtual exposes mute but it's read-only; the physical MV7+ is the settable control.
+for DEV in "Shure MV7+"; do
+  M=$("$MICCTL" get-mute "$DEV" 2>/dev/null) || continue
+  printf '%s\t%s\n' "$DEV" "$M" >> "$STATE"
+done

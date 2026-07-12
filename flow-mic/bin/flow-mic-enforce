@@ -1,0 +1,24 @@
+#!/bin/bash
+# Wispr Flow asynchronously unmutes the mic 2-4s after dictation stops, so a
+# one-shot restore loses the race. Re-apply the saved state for a window after
+# stop. Only the muted state needs enforcing (Wispr only ever unmutes).
+MICCTL="$HOME/.local/bin/micctl"
+STATE="$HOME/.local/state/wispr-mic-state"
+FLAG="$HOME/.local/state/wispr-dictating"
+[ -f "$STATE" ] || exit 0
+SAVED=$(awk -F'\t' '$1=="Shure MV7+"{print $2}' "$STATE")
+
+if [ "$SAVED" != "1" ]; then
+  "$HOME/.local/bin/flow-mic-restore"
+  exit 0
+fi
+
+END=$((SECONDS + 8))
+while [ $SECONDS -lt $END ]; do
+  [ -e "$FLAG" ] && exit 0
+  if [ "$("$MICCTL" get-mute "Shure MV7+" 2>/dev/null)" != "1" ]; then
+    "$MICCTL" set-mute "Shure MV7+" on || true
+  fi
+  sleep 0.3
+done
+exit 0

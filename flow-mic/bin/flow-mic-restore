@@ -1,0 +1,13 @@
+#!/bin/bash
+# Restore mic mute state saved by flow-mic-save.
+MICCTL="$HOME/.local/bin/micctl"
+STATE="$HOME/.local/state/wispr-mic-state"
+[ -f "$STATE" ] || exit 0
+while IFS=$'\t' read -r DEV M; do
+  [ -n "$DEV" ] || continue
+  case "$M" in
+    1) "$MICCTL" set-mute "$DEV" on || true ;;
+    0) "$MICCTL" set-mute "$DEV" off || true ;;
+  esac
+done < "$STATE"
+exit 0

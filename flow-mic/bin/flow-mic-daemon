@@ -1,0 +1,26 @@
+#!/bin/bash
+# Mirrors Wispr Flow dictation state onto the Shure MV7+ hardware mute:
+# save + unmute when recording starts, enforced restore when dictation stops.
+# Driven by Wispr's own log, so it covers pedal and keyboard dictations alike
+# and can never desync the way pedal-side toggle state could.
+WISPR_LOG="$HOME/Library/Logs/Wispr Flow/accessibility.log"
+FLAG="$HOME/.local/state/wispr-dictating"
+MICCTL="$HOME/.local/bin/micctl"
+
+echo "flow-mic-daemon started $(date '+%F %T')"
+
+/usr/bin/tail -n 0 -F "$WISPR_LOG" | while IFS= read -r line; do
+  case "$line" in
+    *"Handling message of type RecordingStarted"*)
+      "$HOME/.local/bin/flow-mic-save"
+      touch "$FLAG"
+      "$MICCTL" set-mute "Shure MV7+" off || true
+      echo "$(date '+%T') recording started: saved state, unmuted"
+      ;;
+    *"Handling message of type DictationStop"*)
+      rm -f "$FLAG"
+      "$HOME/.local/bin/flow-mic-enforce" &
+      echo "$(date '+%T') dictation stopped: enforcing saved state"
+      ;;
+  esac
+done
