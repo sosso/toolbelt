@@ -11,10 +11,24 @@ Small macOS utilities, each in its own directory with an `install.sh`.
 ## Install
 
 ```sh
-./micctl/install.sh     # required by flow-mic
-./keysend/install.sh
-./flow-mic/install.sh
+git clone <this repo> ~/workspace/toolbelt
+~/workspace/toolbelt/bootstrap.sh
 ```
 
-Binaries and script symlinks land in `~/.local/bin`. Swift tools compile with the
-stock Command Line Tools (`swiftc`), no other dependencies.
+Binaries and scripts land in `~/.local/bin`. Swift tools compile with the stock
+Command Line Tools (`swiftc`), no other dependencies. Tools can also be
+installed individually via each directory's `install.sh`.
+
+## Trust model
+
+Deployed files are **copies**, not symlinks — `git pull` changes nothing on the
+live system, including the login-persistent flow-mic daemon. Changes reach the
+machine only through the explicit apply ritual:
+
+```sh
+./bootstrap.sh diff   # preview what apply would change
+./bootstrap.sh        # rebuild, redeploy, restart daemons
+```
+
+Review the diff after every pull, then apply deliberately. Never automate the
+apply.
