@@ -1,0 +1,59 @@
+#!/usr/bin/osascript
+-- Split the focused Ghostty pane 50/50 downward, in the same working directory.
+-- With arguments, runs them as a command in the new pane and drops to a shell when
+-- it exits; with none, just opens a shell.
+--   ghostty-split                 → shell
+--   ghostty-split claude          → a Claude Code session
+--   ghostty-split rsv2 status     → a command with arguments
+
+on paneCwd(t)
+	tell application "Ghostty"
+		-- `working directory` is reported by shell integration at each prompt, so it is
+		-- empty until the pane's shell has drawn its first one. Give a slow .zshrc a moment.
+		repeat 12 times
+			try
+				set d to working directory of t
+				if d is not missing value and d is not "" then return d
+			end try
+			delay 0.25
+		end repeat
+	end tell
+	return (POSIX path of (path to home folder))
+end paneCwd
+
+on run argv
+	set userCmd to ""
+	repeat with a in argv
+		if userCmd is "" then
+			set userCmd to (a as text)
+		else
+			set userCmd to userCmd & " " & (a as text)
+		end if
+	end repeat
+
+	tell application "Ghostty"
+		set hostTerm to focused terminal of selected tab of front window
+		set cwd to my paneCwd(hostTerm)
+
+		if userCmd is "" then
+			set newTerm to split hostTerm direction down with configuration ¬
+				{initial working directory:cwd}
+		else
+			-- Ghostty runs `command` under `login -flp ... bash --noprofile --norc`, where
+			-- ~/.local/bin and the rbenv/nvm/pyenv shims are absent from PATH. Without the
+			-- interactive login shell the pane dies with "failed to launch".
+			--
+			-- That bash also re-parses the command before zsh sees it, so a command
+			-- interpolated into this string would be quote-mangled by two shells. Ship it
+			-- through the environment instead, where nothing parses it, and let zsh's
+			-- `eval` read it exactly once — as if typed at a prompt.
+			set newTerm to split hostTerm direction down with configuration ¬
+				{initial working directory:cwd, ¬
+					command:"zsh -ilc 'eval \"$GHOSTTY_SPLIT_CMD\"; exec zsh -il'", ¬
+					environment variables:{"GHOSTTY_SPLIT_CMD=" & userCmd}}
+		end if
+
+		focus newTerm
+		activate
+	end tell
+end run

@@ -27,5 +27,10 @@ if [ -x /opt/homebrew/bin/SwitchAudioSource ]; then
 else
   echo "audio-switch skipped (brew install switchaudio-osx to enable)"
 fi
+if [ -d /Applications/Ghostty.app ]; then
+  ./ghostty-split/install.sh
+else
+  echo "ghostty-split skipped (Ghostty not installed)"
+fi
 
 echo "toolbelt applied."

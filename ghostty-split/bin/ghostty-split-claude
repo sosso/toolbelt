@@ -1,0 +1,3 @@
+#!/bin/bash
+# Kept as its own name so a Stream Deck applet or Shortcut can point at one command.
+exec "$(dirname "$0")/ghostty-split" claude "$@"

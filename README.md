@@ -8,6 +8,7 @@ Small macOS utilities, each in its own directory with an `install.sh`.
 | [`keysend`](keysend/) | Synthesizes a keyboard chord with *real* modifier keydown/keyup events (the way hardware does it), for apps whose shortcut listeners ignore flags-only synthetic events. |
 | [`flow-mic`](flow-mic/) | launchd daemon that saves/restores a mic's hardware mute state around Wispr Flow dictations: unmutes when recording starts, restores your previous state when it stops. |
 | [`audio-switch`](audio-switch/) | Output-device switching scripts (receiver ↔ built-in speakers) with silent applet wrappers for Stream Deck dock/undock multi-actions. |
+| [`ghostty-split`](ghostty-split/) | Splits the focused Ghostty pane 50/50 downward and starts a Claude Code session in it, in the same working directory. Driven by a Shortcuts.app hotkey. |
 
 ## Install
 
