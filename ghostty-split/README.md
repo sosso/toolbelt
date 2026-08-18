@@ -7,7 +7,7 @@ half, in the same working directory.
 ghostty-split                   # a shell
 ghostty-split claude            # a Claude Code session
 ghostty-split claude --continue # resume the last session in that directory
-ghostty-split rsv2 status       # any command
+ghostty-split htop              # any command
 ghostty-split-claude            # shorthand for `ghostty-split claude`
 ```
 
@@ -26,7 +26,7 @@ trick `audio-switch` uses for Stream Deck's **System → Open** action:
 | Applet | Runs |
 |--------|------|
 | `~/Applications/GhosttySplitClaude.app` | `claude` |
-| `~/Applications/GhosttySplitRsv2.app` | `rsv2` |
+| `~/Applications/GhosttySplitTop.app` | `htop` |
 | `~/Applications/GhosttySplitShell.app` | a plain shell |
 
 Add a button: Stream Deck → **System → Open** → pick the applet. For a new one,

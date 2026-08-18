@@ -4,7 +4,7 @@
 -- it exits; with none, just opens a shell.
 --   ghostty-split                 → shell
 --   ghostty-split claude          → a Claude Code session
---   ghostty-split rsv2 status     → a command with arguments
+--   ghostty-split git status      → a command with arguments
 
 on paneCwd(t)
 	tell application "Ghostty"

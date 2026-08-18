@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 
 APPLETS=(
   "GhosttySplitClaude:claude"
-  "GhosttySplitRsv2:rsv2"
+  "GhosttySplitTop:htop"
   "GhosttySplitShell:"
 )
 
@@ -29,4 +29,4 @@ for entry in "${APPLETS[@]}"; do
     -e "do shell script \"$HOME/.local/bin/ghostty-split $cmd\""
 done
 
-echo "ghostty-split deployed: scripts + ~/Applications/GhosttySplit{Claude,Rsv2,Shell}.app"
+echo "ghostty-split deployed: scripts + ~/Applications/GhosttySplit{Claude,Top,Shell}.app"
