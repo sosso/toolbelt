@@ -10,8 +10,7 @@ PR 19⚠ 4✗ 3✓
 Conflicts, CI failing, CI running, ready to merge — counted in the menu bar,
 listed in the menu. Opening the menu gives you each PR grouped by repository,
 with the number, title and age in aligned columns, and an "open all" action per
-repository. A PR that flips to failing or conflicting raises a notification you
-can click through to GitHub.
+repository.
 
 Requires the [`gh`](https://cli.github.com) CLI, logged in. One
 `gh api graphql` search covers every repository you have an open PR in, so the

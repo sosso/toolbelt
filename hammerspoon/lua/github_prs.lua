@@ -17,7 +17,6 @@ local config = {
   -- Rows shown inline per section; the rest fold into a "N older" submenu.
   maxRowsPerSection = 10,
   openAllStaggerSeconds = 0.2,
-  notifyOnNewFailure = true,
   ghCandidates = { "/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh" },
 }
 
@@ -48,9 +47,9 @@ query($q: String!) {
 local menubar, timer, sleepWatcher
 local gh = util.findExecutable(config.ghCandidates)
 local state = { prs = nil, error = nil, fetchedAt = nil, loading = false }
--- Keyed by PR url, all surviving across polls: the last bucket seen, the last
--- definite mergeability GitHub gave, and which broken state was announced.
-local lastVerdicts, lastMergeable, notified = {}, {}, {}
+-- Keyed by PR url, surviving across polls: the last definite mergeability
+-- GitHub gave.
+local lastMergeable = {}
 
 -- Menu order, most actionable first. `color` paints the menu bar count;
 -- `tone` names the entry in the theme palette used for menu rows.
@@ -131,38 +130,6 @@ local function updateTitle()
   menubar:setTitle(util.styled(runs))
 end
 
-local BROKEN = { failing = true, conflict = true }
-
--- Fires only on a PR crossing from healthy into broken, and at most once per
--- crossing: `notified` latches until the PR is seen healthy again, so a bucket
--- that flaps between the two broken states — or across a poll where the data
--- was incomplete — cannot re-announce itself.
-local function notifyNewFailures(prs)
-  if not config.notifyOnNewFailure then return end
-  local seen = {}
-
-  for _, pr in ipairs(prs) do
-    seen[pr.url] = pr.bucket
-    local was = lastVerdicts[pr.url]
-
-    if not BROKEN[pr.bucket] then
-      notified[pr.url] = nil
-    elseif was and not BROKEN[was] and not notified[pr.url] then
-      notified[pr.url] = pr.bucket
-      hs.notify.new(function() hs.urlevent.openURL(pr.url) end, {
-        title = pr.bucket == "failing" and "CI failed" or "PR now conflicts",
-        subTitle = string.format("#%d %s", pr.number, pr.repository.nameWithOwner),
-        informativeText = pr.title,
-        withdrawAfter = 0,
-      }):send()
-    end
-  end
-
-  -- A PR missing from this poll (merged, closed, or a truncated result) keeps
-  -- its latch rather than being treated as newly healthy.
-  for url in pairs(seen) do lastVerdicts[url] = seen[url] end
-end
-
 local function refresh()
   if state.loading then return end
   state.loading = true
@@ -199,7 +166,6 @@ local function refresh()
 
       state.error = nil
       state.prs = prs
-      notifyNewFailures(prs)
       updateTitle()
     end)
 end

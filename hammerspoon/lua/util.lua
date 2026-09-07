@@ -148,15 +148,12 @@ function M.terminal(command, target)
         'tell application "Terminal"\nactivate\ndo script "%s"\nend tell', command))
     elseif target == "clipboard" then
       hs.pasteboard.setContents(command)
-      hs.notify.new({ title = "Command copied", informativeText = command,
-        withdrawAfter = 5 }):send()
     else
       M.run("/usr/bin/open",
         { "-na", target or "Ghostty", "--args", "-e", "/bin/zsh", "-lc", command },
         function(code, _, err)
           if code ~= 0 then
-            hs.notify.new({ title = "Could not open " .. (target or "Ghostty"),
-              informativeText = err, withdrawAfter = 5 }):send()
+            hs.dialog.blockAlert("Could not open " .. (target or "Ghostty"), err or "", "OK")
           end
         end)
     end
