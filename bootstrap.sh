@@ -12,6 +12,9 @@ if [ "${1:-}" = "diff" ]; then
   done
   PLIST="$HOME/Library/LaunchAgents/com.toolbelt.flow-mic-daemon.plist"
   sed "s|__HOME__|$HOME|g" flow-mic/launchd/com.toolbelt.flow-mic-daemon.plist.template | diff -u "$PLIST" - || rc=1
+  for f in hammerspoon/lua/*.lua; do
+    diff -uN "$HOME/.hammerspoon/$(basename "$f")" "$f" || rc=1
+  done
   echo "(Swift tools are rebuilt from source on every apply; not diffed.)"
   [ $rc -eq 0 ] && echo "no changes: deployed files match the repo."
   exit 0
@@ -31,6 +34,11 @@ if [ -d /Applications/Ghostty.app ]; then
   ./ghostty-split/install.sh
 else
   echo "ghostty-split skipped (Ghostty not installed)"
+fi
+if [ -d /Applications/Hammerspoon.app ]; then
+  ./hammerspoon/install.sh
+else
+  echo "hammerspoon skipped (Hammerspoon not installed)"
 fi
 
 echo "toolbelt applied."
