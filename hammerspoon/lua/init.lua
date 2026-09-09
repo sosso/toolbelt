@@ -26,6 +26,7 @@ end
 menus = {}
 for key, name in pairs({
   github = "github_prs",
+  usage = "claude_usage",
   remy = "remy",
   fleet = "rsv2_fleet",
 }) do

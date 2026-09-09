@@ -1,11 +1,13 @@
 # hammerspoon
 
-A menu bar item for your open pull requests, bucketed by whether they can
-actually merge, plus the small styling library it is built on.
+Two menu bar items — your open pull requests and your Claude usage — plus the
+small styling library they are built on.
 
 ```
-PR 19⚠ 4✗ 3✓
+PR 19⚠ 4✗ 3✓        CC ▰▱▱▱▱ 21% ▰▰▱▱▱ 34%
 ```
+
+## Pull requests
 
 Conflicts, CI failing, CI running, ready to merge — counted in the menu bar,
 listed in the menu. Opening the menu gives you each PR grouped by repository,
@@ -16,6 +18,30 @@ Requires the [`gh`](https://cli.github.com) CLI, logged in. One
 `gh api graphql` search covers every repository you have an open PR in, so the
 poll is a single request no matter how many there are.
 
+## Claude usage
+
+Every rate limit window your plan has — the 5-hour session, the rolling week,
+and any per-model window — as a meter, a percentage and a countdown to reset.
+The menu bar carries the session and the week; a window only shows its reset
+time once it is hot enough for that to change what you would do about it.
+
+Requires a signed-in [Claude Code](https://claude.com/claude-code). It reads the
+OAuth token out of the keychain and calls `GET /api/oauth/usage` on
+`api.anthropic.com` — the endpoint Claude Code's own `/usage` renders — so there
+is no browser cookie to paste and nothing else to install.
+
+The credential belongs to Claude Code rather than Hammerspoon, so depending on
+how it was stored macOS may prompt once before handing it over; choose Always
+Allow, or the item reports the denial and stays empty. The copy of the token in
+`~/.claude/.credentials.json` goes stale and is deliberately not read — only the
+keychain holds the one Claude Code keeps refreshing, and when even that has
+expired the item says so instead of showing a stale number.
+
+Eleven menu bar styles ship with it, from two meters down to a bare bolt that
+grows numbers only past 70%. Switch between them under **Menu bar style**, and
+set the poll interval — 1, 2, 5, 10 or 30 minutes, default 5 — under **Check for
+updates**. Both persist in `hs.settings`.
+
 ## Files
 
 | File | What it is |
@@ -23,6 +49,7 @@ poll is a single request no matter how many there are.
 | `lua/init.lua` | Loads the modules, auto-reloads on save, tears watchers down on reload |
 | `lua/util.lua` | Dracula/Alucard palette, monospaced row layout, subprocess and terminal helpers |
 | `lua/github_prs.lua` | The pull request menu bar item |
+| `lua/claude_usage.lua` | The Claude usage menu bar item |
 
 `init.lua` treats every module as optional, so you can drop your own alongside
 these and list it there. A module that is *present but broken* still reports
