@@ -1,7 +1,10 @@
 # hammerspoon
 
 Two menu bar items — your open pull requests and your Claude usage — plus the
-small styling library they are built on.
+small styling library they are built on, and one module that draws nothing:
+the ⌥Space hotkey that unmutes a hardware-muted mic for a Wispr Flow
+dictation. That one is documented with the rest of its tool, in
+[flow-mic](../flow-mic/).
 
 ```
 PR 19⚠ 4✗ 3✓        CC ▰▱▱▱▱ 21% ▰▰▱▱▱ 34%
@@ -50,6 +53,7 @@ updates**. Both persist in `hs.settings`.
 | `lua/util.lua` | Dracula/Alucard palette, monospaced row layout, subprocess and terminal helpers |
 | `lua/github_prs.lua` | The pull request menu bar item |
 | `lua/claude_usage.lua` | The Claude usage menu bar item |
+| `lua/flow_mic.lua` | The ⌥Space dictation hotkey (see [flow-mic](../flow-mic/)) |
 
 `init.lua` treats every module as optional, so you can drop your own alongside
 these and list it there. A module that is *present but broken* still reports

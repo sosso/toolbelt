@@ -1,0 +1,15 @@
+#!/bin/bash
+# Snapshot the mic's hardware mute, then unmute it for a dictation.
+# flow-mic-enforce puts the snapshot back when the dictation ends.
+. "$HOME/.local/bin/flow-mic-lib.sh"
+
+: > "$STATE"
+if M=$("$MICCTL" get-mute "$MIC" 2>/dev/null); then
+  printf '%s\t%s\n' "$MIC" "$M" >> "$STATE"
+fi
+
+# Raised for as long as a dictation is live: flow-mic-enforce watches it so a
+# dictation started inside its restore window wins over the pending re-mute.
+touch "$FLAG"
+
+"$MICCTL" set-mute "$MIC" off || true

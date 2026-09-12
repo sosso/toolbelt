@@ -1,0 +1,8 @@
+#!/bin/bash
+# Exits 0 while some process is capturing from the mic, via CoreAudio's
+# kAudioDevicePropertyDeviceIsRunningSomewhere. This is the ground truth the
+# Hammerspoon module checks its own toggle state against — the mic either is
+# open or it isn't, whatever we think we last told Wispr to do.
+. "$HOME/.local/bin/flow-mic-lib.sh"
+
+[ "$("$MICCTL" get-running "$MIC" 2>/dev/null)" = "1" ]

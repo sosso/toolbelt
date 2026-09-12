@@ -23,12 +23,16 @@ local function optionalModule(name)
   return nil
 end
 
+-- Not all of these are menu bar items — flow_mic binds a hotkey and draws
+-- nothing — but they share the start()/stop() shape, so they load and tear
+-- down the same way.
 menus = {}
 for key, name in pairs({
   github = "github_prs",
   usage = "claude_usage",
   remy = "remy",
   fleet = "rsv2_fleet",
+  flowMic = "flow_mic",
 }) do
   local module = optionalModule(name)
   if module then menus[key] = module end
