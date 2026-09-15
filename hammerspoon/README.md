@@ -25,8 +25,8 @@ poll is a single request no matter how many there are.
 
 Every rate limit window your plan has — the 5-hour session, the rolling week,
 and any per-model window — as a meter, a percentage and a countdown to reset.
-The menu bar carries the session and the week; a window only shows its reset
-time once it is hot enough for that to change what you would do about it.
+The menu bar carries the session and the week, each with its time left until
+reset.
 
 Requires a signed-in [Claude Code](https://claude.com/claude-code). It reads the
 OAuth token out of the keychain and calls `GET /api/oauth/usage` on

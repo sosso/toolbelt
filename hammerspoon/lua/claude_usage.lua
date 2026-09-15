@@ -17,8 +17,8 @@ local config = {
   securityPath = "/usr/bin/security",
   settingsKey = "hammerspoon.claude_usage.style",
   refreshSettingsKey = "hammerspoon.claude_usage.refreshSeconds",
-  -- A window at or above `warn` colours, and starts carrying its own reset
-  -- countdown in the menu bar title; at or above `crit` it turns red.
+  -- A window at or above `warn` colours, and in the quieter styles starts
+  -- carrying its own reset countdown; at or above `crit` it turns red.
   warnPercent = 70,
   critPercent = 90,
   meterCells = 5,
@@ -28,7 +28,7 @@ local config = {
   settingsURL = "https://claude.ai/settings/usage",
 }
 
-local menubar, timer, sleepWatcher
+local menubar, timer, tickTimer, sleepWatcher
 local state = {
   limits = nil,
   plan = nil,
@@ -91,14 +91,17 @@ local function untilEpoch(epoch)
   return string.format("%dd %dh", math.floor(seconds / 86400), math.floor(seconds % 86400 / 3600))
 end
 
--- The same, shortened to one unit, for the menu bar title.
+-- The same, without spaces, for the menu bar title: "42m", "1h15m", "6d". Under
+-- a day the minutes stay, since that is the range a session's reset lives in.
 local function untilShort(epoch)
   if not epoch then return nil end
   local seconds = epoch - os.time()
   if seconds <= 0 then return "due" end
   if seconds < 3600 then return string.format("%dm", math.floor(seconds / 60)) end
-  if seconds < 86400 then return string.format("%dh", math.floor(seconds / 3600 + 0.5)) end
-  return string.format("%dd", math.floor(seconds / 86400 + 0.5))
+  if seconds < 86400 then
+    return string.format("%dh%02dm", math.floor(seconds / 3600), math.floor(seconds % 3600 / 60))
+  end
+  return string.format("%dd", math.floor(seconds / 86400))
 end
 
 local function clockAt(epoch)
@@ -171,10 +174,8 @@ end
 local STYLES = {
   {
     key = "cc_dual_meter",
-    label = "CC ▱▱▱▱▱ 4% ▰▱▱▱▱ 8%",
-    -- Two meters, one window each, with a window's reset countdown appearing
-    -- only once that window is hot enough for the countdown to change what you
-    -- would do about it.
+    label = "CC ▱▱▱▱▱ 4% 1h15m ▰▱▱▱▱ 8% 6d",
+    -- Two meters, one window each, each followed by its reset countdown.
     render = function(session, weekly)
       local runs = { { "CC ", util.colors.faint } }
       for _, w in ipairs({ session, weekly }) do
@@ -184,10 +185,8 @@ local STYLES = {
             table.insert(runs, run)
           end
           table.insert(runs, { string.format(" %d%%", w.percent), color })
-          if w.percent >= config.warnPercent then
-            local left = untilShort(w.resetsAt)
-            if left then table.insert(runs, { " " .. left, util.colors.faint }) end
-          end
+          local left = untilShort(w.resetsAt)
+          if left then table.insert(runs, { " " .. left, util.colors.faint }) end
           -- Two spaces, so the session's percentage and the week's meter do not
           -- read as one run of digits and blocks.
           table.insert(runs, { "  ", util.colors.faint })
@@ -467,6 +466,10 @@ end
 local function scheduleTimer()
   if timer then timer:stop() end
   timer = hs.timer.doEvery(refreshSeconds(), refresh)
+  -- The countdowns move every minute, and the poll can be half an hour apart,
+  -- so the title is redrawn from the last response in between.
+  if tickTimer then tickTimer:stop() end
+  tickTimer = hs.timer.doEvery(60, updateTitle)
 end
 
 -- ---------------------------------------------------------------------- menu
@@ -656,6 +659,7 @@ end
 
 function M.stop()
   if timer then timer:stop() end
+  if tickTimer then tickTimer:stop() end
   if sleepWatcher then sleepWatcher:stop() end
   if menubar then menubar:delete() end
   menubar = nil
