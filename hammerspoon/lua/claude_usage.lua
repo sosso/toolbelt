@@ -4,6 +4,9 @@
 -- the keychain, then GET /api/oauth/usage — rather than scraping claude.ai with
 -- a browser cookie or shelling out to ccusage. That means no dependency beyond
 -- the two things a Claude Code install already leaves on the machine.
+--
+-- Codex's weekly window rides along after Claude's, read the same way from
+-- the login the Codex CLI keeps in ~/.codex/auth.json.
 
 local util = require("util")
 
@@ -26,6 +29,10 @@ local config = {
   rowWidth = 62,
   rowSize = 14,
   settingsURL = "https://claude.ai/settings/usage",
+  -- What Codex's own /status reads, authed with the ChatGPT login the CLI
+  -- keeps in auth.json.
+  codexUsageURL = "https://chatgpt.com/backend-api/wham/usage",
+  codexAuthPath = os.getenv("HOME") .. "/.codex/auth.json",
 }
 
 local menubar, timer, tickTimer, sleepWatcher
@@ -38,6 +45,8 @@ local state = {
   fetchedAt = nil,
   loading = false,
   raw = nil,
+  codex = nil,
+  codexError = nil,
 }
 
 -- ---------------------------------------------------------------- formatting
@@ -169,28 +178,35 @@ end
 
 -- --------------------------------------------------------------------- style
 
--- Every style takes the two title windows and returns styled runs. They all
--- stay live so the menu can switch between them without a reload.
+local function meterWithReset(runs, w)
+  local color = titleColor(w.percent)
+  for _, run in ipairs(meterRuns(w.percent, config.meterCells, color)) do
+    table.insert(runs, run)
+  end
+  table.insert(runs, { string.format(" %d%%", w.percent), color })
+  local left = untilShort(w.resetsAt)
+  if left then table.insert(runs, { " " .. left, util.colors.faint }) end
+  -- Two spaces, so one window's percentage and the next meter do not read as
+  -- one run of digits and blocks.
+  table.insert(runs, { "  ", util.colors.faint })
+end
+
+-- Every style takes the two title windows plus Codex's weekly window (nil when
+-- Codex is not signed in) and returns styled runs. They all stay live so the
+-- menu can switch between them without a reload.
 local STYLES = {
   {
     key = "cc_dual_meter",
-    label = "CC ▱▱▱▱▱ 4% 1h15m ▰▱▱▱▱ 8% 6d",
-    -- Two meters, one window each, each followed by its reset countdown.
-    render = function(session, weekly)
+    label = "CC ▱▱▱▱▱ 4% 1h15m ▰▱▱▱▱ 8% 6d  CX ▰▱▱▱▱ 17% 5d",
+    -- One meter per window, each followed by its reset countdown.
+    render = function(session, weekly, codex)
       local runs = { { "CC ", util.colors.faint } }
       for _, w in ipairs({ session, weekly }) do
-        if w then
-          local color = titleColor(w.percent)
-          for _, run in ipairs(meterRuns(w.percent, config.meterCells, color)) do
-            table.insert(runs, run)
-          end
-          table.insert(runs, { string.format(" %d%%", w.percent), color })
-          local left = untilShort(w.resetsAt)
-          if left then table.insert(runs, { " " .. left, util.colors.faint }) end
-          -- Two spaces, so the session's percentage and the week's meter do not
-          -- read as one run of digits and blocks.
-          table.insert(runs, { "  ", util.colors.faint })
-        end
+        if w then meterWithReset(runs, w) end
+      end
+      if codex then
+        table.insert(runs, { "CX ", util.colors.faint })
+        meterWithReset(runs, codex)
       end
       return runs
     end,
@@ -366,12 +382,14 @@ local function updateTitle()
   end
 
   local session, weekly = titleWindows()
-  local runs = currentStyle().render(session, weekly)
+  local runs = currentStyle().render(session, weekly, state.codex)
   if #runs == 0 then runs = { { "CC ?", util.colors.faint } } end
   menubar:setTitle(util.styled(runs))
 
   local lines = {}
-  for _, w in ipairs(state.limits) do
+  local windows = { table.unpack(state.limits) }
+  if state.codex then table.insert(windows, state.codex) end
+  for _, w in ipairs(windows) do
     local left = untilEpoch(w.resetsAt)
     table.insert(lines, string.format("%s  %d%%%s", w.label, w.percent,
       left and ("  · resets in " .. left) or ""))
@@ -427,7 +445,68 @@ local function requestUsage(token)
   end)
 end
 
+-- The weekly window is picked by length rather than by slot: plans with a
+-- 5h limit report it as primary_window and the week as secondary, but a plan
+-- with only the weekly limit reports the week as primary.
+local function codexWeekly(rateLimit)
+  local best
+  for _, key in ipairs({ "primary_window", "secondary_window" }) do
+    local w = rateLimit and rateLimit[key]
+    if type(w) == "table" and w.used_percent
+      and (not best or (w.limit_window_seconds or 0) > (best.limit_window_seconds or 0)) then
+      best = w
+    end
+  end
+  if not best then return nil end
+  return {
+    label = "Codex weekly",
+    percent = math.floor(best.used_percent + 0.5),
+    resetsAt = best.reset_at,
+    resetsAtISO = best.reset_at and os.date("!%Y-%m-%dT%H:%M:%SZ", best.reset_at) or nil,
+  }
+end
+
+local function codexFailed(message)
+  state.codex = nil
+  state.codexError = message
+  updateTitle()
+end
+
+local function refreshCodex()
+  local file = io.open(config.codexAuthPath, "r")
+  if not file then
+    -- No Codex login on this machine: show nothing rather than an error.
+    state.codex, state.codexError = nil, nil
+    return updateTitle()
+  end
+  local ok, auth = pcall(hs.json.decode, file:read("*a"))
+  file:close()
+  local tokens = ok and type(auth) == "table" and auth.tokens
+  if not tokens or not tokens.access_token then
+    return codexFailed("Codex auth.json has no ChatGPT token")
+  end
+
+  hs.http.asyncGet(config.codexUsageURL, {
+    Authorization = "Bearer " .. tokens.access_token,
+    ["ChatGPT-Account-Id"] = tokens.account_id,
+    Accept = "application/json",
+  }, function(status, body)
+    if status == 401 or status == 403 then
+      return codexFailed("Codex token expired — run `codex` once to refresh it")
+    end
+    if status ~= 200 then
+      return codexFailed("Codex usage request failed (HTTP " .. tostring(status) .. ")")
+    end
+    local decodedOk, decoded = pcall(hs.json.decode, body)
+    local weekly = decodedOk and type(decoded) == "table" and codexWeekly(decoded.rate_limit)
+    if not weekly then return codexFailed("No weekly window in Codex's usage response") end
+    state.codex, state.codexError = weekly, nil
+    updateTitle()
+  end)
+end
+
 local function refresh()
+  refreshCodex()
   if state.loading then return end
   state.loading = true
 
@@ -487,7 +566,9 @@ local function windowRow(w, p)
       { "", gap = true },
       { bar(w.percent, config.menuBarCells), { color = barColor } },
       { "  " .. percent .. "  ", { color = percentColor } },
-      { left and ("in " .. left) or "no reset", { color = p.faint } },
+      -- Padded to the widest countdown ("in 23h 59m"): the row is right-aligned,
+      -- so a shorter one would shift that row's bar out of line with the rest.
+      { string.format("%-10s", left and ("in " .. left) or "no reset"), { color = p.faint } },
       { "  " },
     }),
     tooltip = w.locked
@@ -559,6 +640,11 @@ local function buildMenu()
   else
     for _, w in ipairs(state.limits) do
       table.insert(items, windowRow(w, p))
+    end
+    if state.codex then
+      table.insert(items, windowRow(state.codex, p))
+    elseif state.codexError then
+      table.insert(items, line(state.codexError, p.secondary))
     end
 
     local notes = {}
@@ -650,6 +736,8 @@ function M.snapshot()
     hint = state.hint,
     fetchedAt = state.fetchedAt,
     windows = rows,
+    codex = state.codex and string.format("%d%% resets %s",
+      state.codex.percent, state.codex.resetsAtISO or "never") or state.codexError,
   }
 end
 
