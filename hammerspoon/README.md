@@ -53,6 +53,7 @@ updates**. Both persist in `hs.settings`.
 | `lua/util.lua` | Dracula/Alucard palette, monospaced row layout, subprocess and terminal helpers |
 | `lua/github_prs.lua` | The pull request menu bar item |
 | `lua/claude_usage.lua` | The Claude usage menu bar item |
+| `lua/blackout.lua` | The batarang that blacks out the built-in display (see [blackout](../blackout/)) |
 | `lua/flow_mic.lua` | The ⌥Space dictation hotkey (see [flow-mic](../flow-mic/)) |
 
 `init.lua` treats every module as optional, so you can drop your own alongside
