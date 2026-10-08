@@ -97,14 +97,39 @@ local function startWatchdog()
   end)
 end
 
+-- The hotkey fires on keydown, while ⌥Space is usually still held, and Wispr's
+-- listener tracks physical key state — so a chord sent straight away reaches
+-- it as ⌥Space⌘⇧PageUp, which is not its shortcut, and the dictation silently
+-- never starts. Releasing the trigger keys synthetically first clears them out
+-- of Wispr's view without waiting for your fingers; the real keyups that
+-- follow are releases of keys already up, which nothing acts on.
+local function pressWisprChordReleasingTrigger()
+  hs.eventtap.event.newKeyEvent(hs.keycodes.map.space, false):post()
+  hs.eventtap.event.newKeyEvent(hs.keycodes.map.alt, false):post()
+  pressWisprChord()
+end
+
 local function toggle()
   if dictating then
-    dictating = false
-    stopWatchdog()
-    -- Restore only once the stop has actually been delivered, not alongside
-    -- it: flow-mic-enforce re-mutes within ~60ms, and muting before Wispr has
-    -- seen the stop takes the tail of the dictation with it.
-    stopWispr(function() script("flow-mic-enforce") end)
+    -- Check the mic before treating this press as a stop. If it isn't open,
+    -- the chord we sent never started a dictation, and stopping would just
+    -- cost another press — send it again instead. flow-mic-start is not
+    -- rerun: the mic is already unmuted, and snapshotting it now would save
+    -- "unmuted" over the state we have to put back.
+    script("flow-mic-active", function(code)
+      if not dictating then return end
+      if code ~= 0 then
+        pressWisprChordReleasingTrigger()
+        startWatchdog()
+        return
+      end
+      dictating = false
+      stopWatchdog()
+      -- Restore only once the stop has actually been delivered, not alongside
+      -- it: flow-mic-enforce re-mutes within ~60ms, and muting before Wispr
+      -- has seen the stop takes the tail of the dictation with it.
+      stopWispr(function() script("flow-mic-enforce") end)
+    end)
     return
   end
 
@@ -115,7 +140,7 @@ local function toggle()
   -- for both in series.
   dictating = true
   script("flow-mic-start")
-  pressWisprChord()
+  pressWisprChordReleasingTrigger()
   startWatchdog()
 end
 
