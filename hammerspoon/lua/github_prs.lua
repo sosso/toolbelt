@@ -44,8 +44,98 @@ query($q: String!) {
 }
 ]]
 
+-- The collapsed icon: SPECTRE's octopus, drawn on a 20x22 grid and scaled
+-- down to fit the menu bar. Each right-hand tentacle is a chain of cubic
+-- Béziers (root, control, control, point, control, control, tip), x out from
+-- the centre line and y down from the top of the head; the left half mirrors
+-- them. They hang in an S and flick outward at the tip, which is most of what
+-- tells the shape apart from a spider.
+local OCTOPUS = {
+  w = 20, h = 22, scale = 0.85,
+  tentacles = {
+    { root = 1.25, pts = { { 2.6, 8.8 }, { 5.5, 8.4 }, { 8.6, 9.2 }, { 9.2, 12.4 }, { 9.5, 14 }, { 9.2, 15 }, { 9.8, 16 } } },
+    { root = 1.2, pts = { { 2.2, 9.6 }, { 4.2, 10.6 }, { 6.6, 12.4 }, { 6.6, 15.6 }, { 6.6, 17.4 }, { 6.6, 18.4 }, { 7.6, 19.4 } } },
+    { root = 0.95, pts = { { 1.4, 10.2 }, { 2.6, 12 }, { 3.8, 14.2 }, { 3.6, 17.2 }, { 3.5, 19 }, { 3.7, 20.2 }, { 4.6, 21.2 } } },
+    { root = 0.95, pts = { { 0.5, 10.4 }, { 0.9, 13 }, { 1.4, 15.6 }, { 1.1, 18.2 }, { 0.9, 19.6 }, { 1.0, 20.8 }, { 1.6, 21.6 } } },
+  },
+}
+
+local function cubic(a, b, c, d, t)
+  local u = 1 - t
+  local k1, k2, k3, k4 = u * u * u, 3 * u * u * t, 3 * u * t * t, t * t * t
+  return k1 * a[1] + k2 * b[1] + k3 * c[1] + k4 * d[1],
+    k1 * a[2] + k2 * b[2] + k3 * c[2] + k4 * d[2]
+end
+
+-- The point `t` (0 to 1) of the way along a chain of cubics.
+local function along(pts, t)
+  local n = (#pts - 1) / 3
+  local seg = math.min(math.floor(t * n), n - 1)
+  local i = seg * 3 + 1
+  return cubic(pts[i], pts[i + 1], pts[i + 2], pts[i + 3], t * n - seg)
+end
+
+-- The outline of one tentacle: its curve thickened either side, narrowing from
+-- the root to a point at the tip.
+local function tentacle(spec, side)
+  local steps = 32
+  local one, other = {}, {}
+  for i = 0, steps do
+    local t = i / steps
+    local x, y = along(spec.pts, t)
+    local ax, ay = along(spec.pts, math.max(t - 0.005, 0))
+    local bx, by = along(spec.pts, math.min(t + 0.005, 1))
+    local dx, dy = bx - ax, by - ay
+    local len = math.sqrt(dx * dx + dy * dy)
+    local w = spec.root * (1 - t) ^ 1.3
+    one[#one + 1] = { x - dy / len * w, y + dx / len * w }
+    other[#other + 1] = { x + dy / len * w, y - dx / len * w }
+  end
+  for i = #other, 1, -1 do one[#one + 1] = other[i] end
+
+  local points = {}
+  for i, p in ipairs(one) do
+    points[i] = { x = OCTOPUS.w / 2 + side * p[1], y = p[2] }
+  end
+  return points
+end
+
+local function octopus(color)
+  local cx, k = OCTOPUS.w / 2, OCTOPUS.scale
+  local canvas = hs.canvas.new({ x = 0, y = 0, w = math.ceil(OCTOPUS.w * k), h = math.ceil(OCTOPUS.h * k) })
+  canvas:transformation(hs.canvas.matrix.scale(k))
+  -- The head, and a neck under it that the tentacles grow out of.
+  canvas[1] = {
+    type = "oval", action = "fill", fillColor = color,
+    frame = { x = cx - 4.6, y = 0.3, w = 9.2, h = 9.4 },
+  }
+  canvas[2] = {
+    type = "rectangle", action = "fill", fillColor = color,
+    frame = { x = cx - 2.8, y = 6, w = 5.6, h = 4.8 },
+    roundedRectRadii = { xRadius = 1.5, yRadius = 1.5 },
+  }
+  for _, spec in ipairs(OCTOPUS.tentacles) do
+    for _, side in ipairs({ 1, -1 }) do
+      canvas[#canvas + 1] = {
+        type = "segments", closed = true, action = "fill", fillColor = color,
+        coordinates = tentacle(spec, side),
+      }
+    end
+  end
+  -- The two notches either side of the neck, cut out of what is under them.
+  for _, side in ipairs({ 1, -1 }) do
+    canvas[#canvas + 1] = {
+      type = "oval", action = "fill", fillColor = { white = 0 }, compositeRule = "clear",
+      frame = { x = cx + side * 3.3 - 0.8, y = 8.2, w = 1.6, h = 1.0 },
+    }
+  end
+  local image = canvas:imageFromCanvas()
+  canvas:delete()
+  return image
+end
+
 local menubar, timer, sleepWatcher
-local collapse = util.collapsible("hammerspoon.github_prs.collapsed", "⎇")
+local collapse = util.collapsible("hammerspoon.github_prs.collapsed", octopus)
 local gh = util.findExecutable(config.ghCandidates)
 local state = { prs = nil, error = nil, fetchedAt = nil, loading = false }
 -- Keyed by PR url, surviving across polls: the last definite mergeability

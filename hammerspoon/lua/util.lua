@@ -226,6 +226,9 @@ end
 -- An item with a menu ignores its click callback, so collapsing drops the menu
 -- and expanding is the click. `redraw` is the item's own updateTitle, which
 -- should check `collapsed()` first and call `draw()` instead.
+--
+-- `glyph` is either one character or a function(color) that draws the icon
+-- itself and returns an hs.image, for a shape no font has.
 function M.collapsible(key, glyph)
   local c = { menubar = nil, buildMenu = nil, redraw = nil }
 
@@ -264,9 +267,15 @@ function M.collapsible(key, glyph)
   -- of the item. `color` defaults to white; a caller passes one only to flag
   -- trouble.
   function c.draw(color)
+    color = color or M.colors.primary
+    c.menubar:setTitle("")
+    if type(glyph) == "function" then
+      return c.menubar:setIcon(glyph(color), false)
+    end
+
     local text = hs.styledtext.new(glyph, {
       font = { name = "Menlo", size = 15 },
-      color = color or M.colors.primary,
+      color = color,
     })
     local size = hs.drawing.getTextDrawingSize(text)
     local w, h = math.ceil(size.w), 22
@@ -278,16 +287,17 @@ function M.collapsible(key, glyph)
     }
     local image = canvas:imageFromCanvas()
     canvas:delete()
-    c.menubar:setTitle("")
     c.menubar:setIcon(image, false)
   end
 
+  -- A drawn icon has no character to preview in the row, so it is left off.
   function c.menuItem(p, width, size)
+    local preview = type(glyph) == "string" and glyph .. "  " or ""
     return {
       title = M.row(width, size, {
         { "  Collapse to icon", { color = p.cyan } },
         { "", gap = true },
-        { glyph .. "  ", { color = p.faint } },
+        { preview, { color = p.faint } },
       }),
       fn = function() c.set(true) end,
     }
