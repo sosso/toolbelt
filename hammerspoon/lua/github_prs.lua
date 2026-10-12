@@ -45,6 +45,7 @@ query($q: String!) {
 ]]
 
 local menubar, timer, sleepWatcher
+local collapse = util.collapsible("hammerspoon.github_prs.collapsed", "⎇")
 local gh = util.findExecutable(config.ghCandidates)
 local state = { prs = nil, error = nil, fetchedAt = nil, loading = false }
 -- Keyed by PR url, surviving across polls: the last definite mergeability
@@ -108,6 +109,9 @@ end
 local function updateTitle()
   if not menubar then return end
 
+  if collapse.collapsed() then
+    return collapse.draw(state.error and util.colors.red or nil)
+  end
   if state.error then
     return menubar:setTitle(util.styled({ { "PR ", util.colors.faint }, { "⚠", util.colors.red } }))
   end
@@ -361,6 +365,7 @@ local function buildMenu()
       { { "  Open GitHub PR dashboard", { color = p.cyan } } }),
     fn = util.openURL("https://github.com/pulls"),
   })
+  table.insert(items, collapse.menuItem(p, config.rowWidth, config.rowSize))
 
   return items
 end
@@ -371,8 +376,7 @@ function M.start()
   -- one the item is anonymous, so it cannot be shown, hidden or reordered.
   menubar = hs.menubar.new(true, "hammerspoon.github_prs")
   if not menubar then return end
-  menubar:setMenu(buildMenu)
-  updateTitle()
+  collapse.attach(menubar, buildMenu, updateTitle)
   refresh()
 
   timer = hs.timer.doEvery(config.refreshSeconds, refresh)

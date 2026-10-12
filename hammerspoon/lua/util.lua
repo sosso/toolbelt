@@ -219,4 +219,81 @@ function M.run(path, args, callback)
   return task
 end
 
+-- Lets a menu bar item shrink to a single white glyph, for when the menu bar
+-- is short on room (a laptop screen with no external monitor). Remembered per
+-- item in hs.settings under `key`.
+--
+-- An item with a menu ignores its click callback, so collapsing drops the menu
+-- and expanding is the click. `redraw` is the item's own updateTitle, which
+-- should check `collapsed()` first and call `draw()` instead.
+function M.collapsible(key, glyph)
+  local c = { menubar = nil, buildMenu = nil, redraw = nil }
+
+  function c.collapsed()
+    return hs.settings.get(key) == true
+  end
+
+  function c.apply()
+    local menubar = c.menubar
+    if not menubar then return end
+    if c.collapsed() then
+      menubar:setMenu(nil)
+      menubar:setClickCallback(function() c.set(false) end)
+      menubar:setTooltip("Click to expand")
+    else
+      menubar:setIcon(nil)
+      menubar:setClickCallback(nil)
+      menubar:setMenu(c.buildMenu)
+      menubar:setTooltip("")
+    end
+    if c.redraw then c.redraw() end
+  end
+
+  function c.set(collapsed)
+    hs.settings.set(key, collapsed)
+    c.apply()
+  end
+
+  function c.attach(menubar, buildMenu, redraw)
+    c.menubar, c.buildMenu, c.redraw = menubar, buildMenu, redraw
+    c.apply()
+  end
+
+  -- Drawn as an image cropped to the glyph rather than set as a title: macOS
+  -- pads a text title on both sides, which on a one-character title is most
+  -- of the item. `color` defaults to white; a caller passes one only to flag
+  -- trouble.
+  function c.draw(color)
+    local text = hs.styledtext.new(glyph, {
+      font = { name = "Menlo", size = 15 },
+      color = color or M.colors.primary,
+    })
+    local size = hs.drawing.getTextDrawingSize(text)
+    local w, h = math.ceil(size.w), 22
+    local canvas = hs.canvas.new({ x = 0, y = 0, w = w, h = h })
+    canvas[1] = {
+      type = "text",
+      text = text,
+      frame = { x = 0, y = (h - size.h) / 2, w = w, h = size.h },
+    }
+    local image = canvas:imageFromCanvas()
+    canvas:delete()
+    c.menubar:setTitle("")
+    c.menubar:setIcon(image, false)
+  end
+
+  function c.menuItem(p, width, size)
+    return {
+      title = M.row(width, size, {
+        { "  Collapse to icon", { color = p.cyan } },
+        { "", gap = true },
+        { glyph .. "  ", { color = p.faint } },
+      }),
+      fn = function() c.set(true) end,
+    }
+  end
+
+  return c
+end
+
 return M

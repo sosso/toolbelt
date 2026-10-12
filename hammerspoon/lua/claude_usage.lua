@@ -36,6 +36,8 @@ local config = {
 }
 
 local menubar, timer, tickTimer, sleepWatcher
+-- ϟ rather than ⚡: the emoji ignores the text colour.
+local collapse = util.collapsible("hammerspoon.claude_usage.collapsed", "ϟ")
 local state = {
   limits = nil,
   plan = nil,
@@ -369,8 +371,25 @@ local function currentStyle()
   return STYLES[1]
 end
 
+-- The collapsed title is one glyph, so the only thing it can still say is
+-- whether the hottest window has crossed a threshold; otherwise it stays white.
+local function collapsedColor()
+  if state.error then return util.colors.red end
+  local worst = 0
+  local session, weekly = titleWindows()
+  for _, w in ipairs({ session, weekly, state.codex }) do
+    if w and w.percent > worst then worst = w.percent end
+  end
+  local tone = toneOf(worst)
+  return tone and util.colors[tone] or nil
+end
+
 local function updateTitle()
   if not menubar then return end
+
+  if collapse.collapsed() then
+    return collapse.draw(collapsedColor())
+  end
 
   if state.error then
     return menubar:setTitle(util.styled({
@@ -675,6 +694,7 @@ local function buildMenu()
     }),
     menu = intervalMenu(p),
   })
+  table.insert(items, collapse.menuItem(p, config.rowWidth, config.rowSize))
   table.insert(items, {
     title = util.row(config.rowWidth, config.rowSize, {
       { "  Refresh now", { color = p.cyan } },
@@ -707,8 +727,7 @@ function M.start()
   -- what a menu bar manager (Thaw, Ice, Bartender) lists it by.
   menubar = hs.menubar.new(true, "hammerspoon.claude_usage")
   if not menubar then return end
-  menubar:setMenu(buildMenu)
-  updateTitle()
+  collapse.attach(menubar, buildMenu, updateTitle)
   refresh()
 
   scheduleTimer()
@@ -731,6 +750,7 @@ function M.snapshot()
   end
   return {
     style = currentStyle().key,
+    collapsed = collapse.collapsed(),
     refreshSeconds = refreshSeconds(),
     error = state.error,
     hint = state.hint,
