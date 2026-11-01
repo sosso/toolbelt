@@ -229,6 +229,33 @@ end
 --
 -- `glyph` is either one character or a function(color) that draws the icon
 -- itself and returns an hs.image, for a shape no font has.
+--
+-- ⌘-clicking the item toggles it either way. One event tap serves every
+-- collapsible: it swallows a ⌘-click that lands on an attached item's frame,
+-- so AppKit never opens the menu or fires the plain click callback.
+local collapsibles = {}
+local cmdClickTap
+
+local function toggleUnderCmdClick(event)
+  if not event:getFlags().cmd then return false end
+  local point = hs.geometry.new(event:location())
+  for _, c in ipairs(collapsibles) do
+    local frame = c.menubar and c.menubar:frame()
+    if frame and point:inside(frame) then
+      c.set(not c.collapsed())
+      return true
+    end
+  end
+  return false
+end
+
+local function watchCmdClicks()
+  if cmdClickTap then return end
+  cmdClickTap = hs.eventtap.new(
+    { hs.eventtap.event.types.leftMouseDown }, toggleUnderCmdClick)
+  cmdClickTap:start()
+end
+
 function M.collapsible(key, glyph)
   local c = { menubar = nil, buildMenu = nil, redraw = nil }
 
@@ -242,7 +269,7 @@ function M.collapsible(key, glyph)
     if c.collapsed() then
       menubar:setMenu(nil)
       menubar:setClickCallback(function() c.set(false) end)
-      menubar:setTooltip("Click to expand")
+      menubar:setTooltip("Click or ⌘-click to expand")
     else
       menubar:setIcon(nil)
       menubar:setClickCallback(nil)
@@ -259,6 +286,8 @@ function M.collapsible(key, glyph)
 
   function c.attach(menubar, buildMenu, redraw)
     c.menubar, c.buildMenu, c.redraw = menubar, buildMenu, redraw
+    table.insert(collapsibles, c)
+    watchCmdClicks()
     c.apply()
   end
 
@@ -297,7 +326,7 @@ function M.collapsible(key, glyph)
       title = M.row(width, size, {
         { "  Collapse to icon", { color = p.cyan } },
         { "", gap = true },
-        { preview, { color = p.faint } },
+        { preview .. "⌘-click  ", { color = p.faint } },
       }),
       fn = function() c.set(true) end,
     }
