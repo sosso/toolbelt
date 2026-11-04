@@ -233,11 +233,18 @@ end
 -- ⌘-clicking the item toggles it either way. One event tap serves every
 -- collapsible: it swallows a ⌘-click that lands on an attached item's frame,
 -- so AppKit never opens the menu or fires the plain click callback.
+--
+-- Only a real click counts. Menu bar managers (Thaw, Ice) move items by posting
+-- ⌘-presses of their own, often onto a neighbouring item's frame: swallowing
+-- one flips that item and makes the manager's move time out. A posted event
+-- names its source process; a click from the mouse reports 0.
 local collapsibles = {}
 local cmdClickTap
 
 local function toggleUnderCmdClick(event)
   if not event:getFlags().cmd then return false end
+  local sourcePid = event:getProperty(hs.eventtap.event.properties.eventSourceUnixProcessID)
+  if sourcePid ~= 0 then return false end
   local point = hs.geometry.new(event:location())
   for _, c in ipairs(collapsibles) do
     local frame = c.menubar and c.menubar:frame()
