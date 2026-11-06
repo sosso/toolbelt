@@ -178,6 +178,18 @@ local function titleWindows()
   return session, weekly
 end
 
+-- The windows that are present, in order. `ipairs({ session, weekly })` stops
+-- at the first nil, so a plan with no session window would lose the weekly
+-- one too.
+local function present(...)
+  local out = {}
+  for i = 1, select("#", ...) do
+    local w = select(i, ...)
+    if w then table.insert(out, w) end
+  end
+  return out
+end
+
 -- --------------------------------------------------------------------- style
 
 local function meterWithReset(runs, w)
@@ -203,7 +215,7 @@ local STYLES = {
     -- One meter per window, each followed by its reset countdown.
     render = function(session, weekly, codex)
       local runs = { { "CC ", util.colors.faint } }
-      for _, w in ipairs({ session, weekly }) do
+      for _, w in ipairs(present(session, weekly)) do
         if w then meterWithReset(runs, w) end
       end
       if codex then
@@ -218,7 +230,7 @@ local STYLES = {
     label = "CC 4% 8%",
     render = function(session, weekly)
       local runs = { { "CC", util.colors.faint } }
-      for _, w in ipairs({ session, weekly }) do
+      for _, w in ipairs(present(session, weekly)) do
         if w then
           table.insert(runs, { string.format(" %d%%", w.percent), titleColor(w.percent) })
         end
@@ -284,7 +296,7 @@ local STYLES = {
     label = "⚡ ▁▁",
     render = function(session, weekly)
       local runs = { { "⚡ ", util.colors.faint } }
-      for _, w in ipairs({ session, weekly }) do
+      for _, w in ipairs(present(session, weekly)) do
         if w then table.insert(runs, { spark(w.percent), titleColor(w.percent) }) end
       end
       return runs
@@ -333,7 +345,7 @@ local STYLES = {
     label = "⚡  (numbers only when hot)",
     render = function(session, weekly)
       local hot
-      for _, w in ipairs({ session, weekly }) do
+      for _, w in ipairs(present(session, weekly)) do
         if w and w.percent >= config.warnPercent and (not hot or w.percent > hot.percent) then
           hot = w
         end
@@ -377,7 +389,7 @@ local function collapsedColor()
   if state.error then return util.colors.red end
   local worst = 0
   local session, weekly = titleWindows()
-  for _, w in ipairs({ session, weekly, state.codex }) do
+  for _, w in ipairs(present(session, weekly, state.codex)) do
     if w and w.percent > worst then worst = w.percent end
   end
   local tone = toneOf(worst)
