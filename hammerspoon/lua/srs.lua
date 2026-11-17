@@ -539,6 +539,13 @@ end
 M.tryPopup = tryPopup
 M.launch = launch
 
+-- Where the item sits, for screenshots: "x,y,w,h" in screen points.
+function M.frame()
+  if not menubar then return nil end
+  local f = menubar:frame()
+  return string.format("%d,%d,%d,%d", f.x, f.y, f.w, f.h)
+end
+
 function M.stop()
   if timer then timer:stop() end
   if stateWatcher then stateWatcher:stop() end
