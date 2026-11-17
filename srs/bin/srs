@@ -49,6 +49,11 @@ LAST_BOX = len(BOX_INTERVALS) - 1
 JITTER = 0.1
 MISS_RETRY = 10 * 60
 HISTORY_KEEP = 30
+# SRS_SEED makes a run repeatable — the same cards, data and order — which is
+# how the screenshots in docs/ are regenerated.
+SEED = int(os.environ["SRS_SEED"]) if os.environ.get("SRS_SEED") else None
+if SEED is not None:
+    random.seed(SEED)
 
 
 # ── terminal ────────────────────────────────────────────────────────────────
@@ -482,7 +487,7 @@ def run_keys_card(template, rng):
             print("  %s got      %s" % (RED("✗"), text))
             print("    wanted   %s" % p["goal"])
     print("\n  " + FAINT("par: ") + "   ⏎   ".join(PINK(render_route(p["route"])) for p in card["phases"]))
-    print("  " + FAINT("how: ") + card["solution"])
+    print("  " + FAINT("how: ") + wrapped(card["solution"], 90).replace("\n", "\n       "))
     for g in ("miss", "ok"):
         if g in grades:
             return g
@@ -1180,7 +1185,7 @@ def teach_lateral(template, rng):
     print()
     print(CYAN(duck(sc["db"], sc["solution"], fmt="-box")[0].rstrip()))
     print()
-    print(FAINT("why: ") + sc["why"])
+    print(FAINT("why: ") + wrapped(sc["why"], 90).replace("\n", "\n     "))
     print()
 
 
@@ -1231,7 +1236,7 @@ def run_lateral_card(template, rng):
             continue
         if choice == "show":
             print("\n" + GREEN(pretty_sql(sc["solution"])))
-            print("\n" + FAINT("why: ") + sc["why"])
+            print("\n" + FAINT("why: ") + wrapped(sc["why"], 90).replace("\n", "\n     "))
             return "miss"
         subprocess.call(editor_command(path))
         with open(path) as f:
@@ -1261,7 +1266,7 @@ def run_lateral_card(template, rng):
             used_lateral_late = True
             continue
         print(GREEN("✓ that's it") + FAINT("  (%d attempt%s)" % (attempts, "" if attempts == 1 else "s")))
-        print("\n" + FAINT("why: ") + sc["why"])
+        print("\n" + FAINT("why: ") + wrapped(sc["why"], 90).replace("\n", "\n     "))
         return "perfect" if attempts == 1 and not used_lateral_late else "ok"
 
 
@@ -1597,7 +1602,7 @@ def run_session(args):
         if choice == "quit":
             return 0
 
-    rng = random.Random()
+    rng = random.Random(SEED)
     tally = []
     if not state["modules"][module_id]["primer_seen"]:
         clear()
@@ -1709,7 +1714,7 @@ def learn_session(args):
             print("cards in %s: %s" % (args[0], ", ".join(tids)))
             return 2
         tids = [args[1]]
-    rng = random.Random()
+    rng = random.Random(SEED)
     clear()
     show_lesson(module.primer)
     state = load_state()

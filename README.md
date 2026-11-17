@@ -13,6 +13,10 @@ Small macOS utilities, each in its own directory with an `install.sh`.
 | [`srs`](srs/) | Spaced-repetition drills that pop up from the menu bar at random — terminal line editing in real zsh, lateral joins against DuckDB — with Leitner boxes, a daily streak and graduation. Holds off while a Focus is on. |
 | [`hammerspoon`](hammerspoon/) | Menu bar item for your open pull requests, bucketed by whether they can actually merge — CI state, conflicts, review — from one `gh` GraphQL call. Plus the Dracula-themed styling library it is built on. |
 
+[srs](srs/) in action — a first popup teaches before it asks:
+
+![srs: primer, lesson and rehearsal, then a graded card](srs/docs/images/first-contact.webp)
+
 ## Install
 
 ```sh
