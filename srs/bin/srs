@@ -1644,14 +1644,36 @@ def run_session(args):
             if ask(FAINT("\n[Return] next   [q] stop here  "), ["next", "quit"]) == "quit":
                 break
 
-    if tally:
-        state = load_state()
-        print("\n" + FAINT("streak ") + ORANGE("%d day%s" % (current_streak(state), "" if current_streak(state) == 1 else "s"))
-              + FAINT("  ·  ") + " ".join({"perfect": GREEN("●"), "ok": YELLOW("●"), "miss": RED("●")}[g] for g in tally))
-        if popup:
-            drain_input()
-            ask(FAINT("[Return] back to work  "), ["done"])
+    if not tally:
+        return 0
+    state = load_state()
+    print("\n" + FAINT("streak ") + ORANGE("%d day%s" % (current_streak(state), "" if current_streak(state) == 1 else "s"))
+          + FAINT("  ·  ") + " ".join({"perfect": GREEN("●"), "ok": YELLOW("●"), "miss": RED("●")}[g] for g in tally))
+
+    # The window closes when this returns, so it always waits — and offers
+    # the next module while you're in the mood.
+    following = next_module(state, module_id)
+    drain_input()
+    if not following:
+        ask(FAINT("[Return] back to work  "), ["done"])
+        return 0
+    other_id, due = following
+    offer = ("%s · %d due" % (MODULES[other_id].title, due) if due
+             else "practise %s" % MODULES[other_id].title)
+    if ask(FAINT("[Return] back to work   [n] next: ") + offer + "  ", ["done", "next"]) == "next":
+        return run_session([other_id] + ([] if due else ["--practice"]))
     return 0
+
+
+def next_module(state, current, now=None):
+    """The module to offer after this one: whichever other one has the most
+    due, or failing that any other active one to practise. (id, due) or None."""
+    now = time.time() if now is None else now
+    others = [m for m in MODULES if m != current and state["modules"][m]["active"]]
+    due = [(m, len(due_templates(state, m, now))) for m in others if m in pickable(state, now)]
+    if due:
+        return max(due, key=lambda pair: pair[1])
+    return (others[0], 0) if others else None
 
 
 def choose_session(state, module_id, practice, now=None):

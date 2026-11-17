@@ -166,6 +166,23 @@ class Lessons(unittest.TestCase):
         self.assertEqual(cards[session[0]]["seen"], 0)
 
 
+class NextModule(unittest.TestCase):
+    def test_offers_the_other_module_with_cards_due(self):
+        state = srs.with_defaults({})
+        self.assertEqual(srs.next_module(state, "keys", now=1), ("lateral", len(srs.LATERAL.templates)))
+
+    def test_offers_practice_when_nothing_else_is_due(self):
+        state = srs.with_defaults({})
+        for c in state["modules"]["lateral"]["cards"].values():
+            c.update(seen=1, box=1, due=10 ** 12)
+        self.assertEqual(srs.next_module(state, "keys", now=1), ("lateral", 0))
+
+    def test_paused_modules_are_not_offered(self):
+        state = srs.with_defaults({})
+        state["modules"]["lateral"]["active"] = False
+        self.assertIsNone(srs.next_module(state, "keys", now=1))
+
+
 class Scheduling(unittest.TestCase):
     def test_six_perfects_graduate_a_card(self):
         card = srs.new_card()
