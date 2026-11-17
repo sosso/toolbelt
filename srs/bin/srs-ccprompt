@@ -1,0 +1,400 @@
+#!/usr/bin/python3
+"""A stand-in for Claude Code's prompt box, for drilling its editing keys.
+
+    srs-ccprompt SPEC.json OUT.json
+
+It behaves the way Claude Code's interactive-mode docs describe the input
+(https://code.claude.com/docs/en/interactive-mode): readline-style kills that
+can be pasted back, Ctrl+S to stash and restore, Esc Esc to clear a draft into
+history, Ctrl+_ to undo, Ctrl+J for a newline, Ctrl+G to edit in $EDITOR and
+Ctrl+R to search past prompts. It is an imitation — where the docs are silent
+it takes the plainest reading — but the keys and what they do match.
+
+SPEC holds the starting state:
+    phases      [{"text", "cursor", "label"}] — each phase ends when you press
+                Enter; stash, kill buffer and history carry across phases
+    history     older prompts, oldest first
+    undo        [[text, cursor], ...] edits that can be undone
+    kill        text a Ctrl+Y would paste
+
+OUT gets {"aborted": bool, "phases": [{"text", "keys", "used"}]}: what was
+sent, how many keystrokes it took (the Enter that sends isn't counted), and
+which editing commands were used. Ctrl+C gives up.
+"""
+import json
+import os
+import select
+import shutil
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import tty
+
+ESC = "\x1b"
+PINK, CYAN, FAINT, BOLD, REVERSE, RESET = (
+    "\x1b[38;2;255;121;198m", "\x1b[38;2;139;233;253m", "\x1b[38;2;98;114;164m", "\x1b[1m", "\x1b[7m", "\x1b[0m")
+BORDER = "\x1b[38;2;98;114;164m"
+
+CONTROL = {
+    "\x01": "start-of-line", "\x05": "end-of-line", "\x02": "back-char", "\x06": "forward-char",
+    "\x0b": "kill-to-end", "\x15": "kill-to-start", "\x17": "kill-word", "\x19": "paste",
+    "\x13": "stash", "\x1f": "undo", "\n": "newline", "\x07": "editor", "\x12": "search",
+    "\x7f": "backspace", "\x08": "backspace", "\r": "submit", "\x03": "abort",
+}
+SEQUENCES = {"[A": "up", "[B": "down", "[C": "right", "[D": "left", "OA": "up", "OB": "down",
+             "OC": "right", "OD": "left", "[H": "start-of-line", "[F": "end-of-line", "[3~": "delete"}
+KILLS = ("kill-to-end", "kill-to-start", "kill-word")
+EDITS = ("insert", "backspace", "delete", "newline", "paste", "stash", "esc-esc") + KILLS
+
+
+class Keys:
+    """Raw keystrokes decoded into named commands or typed text."""
+
+    # A second Esc this soon after the first is Esc Esc — a person's double
+    # press, not the 50ms that separates an escape sequence's bytes.
+    DOUBLE_ESC = 0.6
+
+    def __init__(self, fd):
+        self.fd = fd
+        self.last_esc = 0
+
+    def _byte(self, timeout=None):
+        if timeout is not None and not select.select([self.fd], [], [], timeout)[0]:
+            return None
+        return os.read(self.fd, 1)
+
+    def next(self):
+        b = self._byte()
+        if not b:
+            return ("abort", None)
+        if b == b"\x1b":
+            nxt = self._byte(0.05)
+            if nxt in (b"[", b"O"):
+                seq = nxt.decode()
+                while True:
+                    c = self._byte(0.05)
+                    if c is None:
+                        break
+                    seq += c.decode(errors="replace")
+                    if c.isalpha() or c == b"~":
+                        break
+                return (SEQUENCES.get(seq, "unknown"), None)
+            if nxt == b"\x1b":
+                self.last_esc = 0
+                return ("esc-esc", None)
+            now = time.time()
+            if now - self.last_esc < self.DOUBLE_ESC:
+                self.last_esc = 0
+                return ("esc-esc", None)
+            self.last_esc = now
+            return ("esc", None)
+        ch = b.decode(errors="replace")
+        if ch in CONTROL:
+            return (CONTROL[ch], None)
+        if b[0] >= 0xC0:  # the rest of a UTF-8 character
+            need = 1 if b[0] < 0xE0 else 2 if b[0] < 0xF0 else 3
+            b += os.read(self.fd, need)
+            ch = b.decode(errors="replace")
+        if ch.isprintable():
+            return ("insert", ch)
+        return ("unknown", None)
+
+
+class Prompt:
+    def __init__(self, spec):
+        self.history = list(spec.get("history", []))
+        self.undo_stack = [(t, c) for t, c in spec.get("undo", [])]
+        self.kill = spec.get("kill", "")
+        self.stash = None
+        self.text, self.cursor = "", 0
+        self.last = None
+        self.hist_at = None
+        self.pending = ""
+        self.search = None  # (query, skip) while searching
+        self.drawn_rows, self.cursor_row = 0, 0
+        cols = shutil.get_terminal_size((100, 40)).columns
+        self.width = max(min(cols - 2, 98), 40)
+
+    # ── geometry ──────────────────────────────────────────────────────────
+    def line_bounds(self):
+        start = self.text.rfind("\n", 0, self.cursor) + 1
+        end = self.text.find("\n", self.cursor)
+        return start, (len(self.text) if end == -1 else end)
+
+    # ── editing ───────────────────────────────────────────────────────────
+    def snapshot(self):
+        self.undo_stack.append((self.text, self.cursor))
+
+    def replace(self, start, end, new=""):
+        self.text = self.text[:start] + new + self.text[end:]
+        self.cursor = start + len(new)
+
+    def killed(self, piece, before):
+        """Consecutive kills build one piece, the way readline does — so a
+        line cleared with several Ctrl+U presses pastes back whole."""
+        if self.last in KILLS:
+            self.kill = piece + self.kill if before else self.kill + piece
+        else:
+            self.kill = piece
+
+    def do(self, cmd, arg):
+        start, end = self.line_bounds()
+        # Every change can be undone; a run of typing undoes as one.
+        if cmd in EDITS and not (cmd == "insert" and self.last == "insert"):
+            self.snapshot()
+        if cmd == "insert":
+            self.replace(self.cursor, self.cursor, arg)
+        elif cmd == "newline":
+            self.replace(self.cursor, self.cursor, "\n")
+        elif cmd == "backspace":
+            if self.cursor:
+                self.replace(self.cursor - 1, self.cursor)
+        elif cmd == "delete":
+            self.replace(self.cursor, self.cursor + 1)
+        elif cmd == "left":
+            self.cursor = max(self.cursor - 1, 0)
+        elif cmd == "right":
+            self.cursor = min(self.cursor + 1, len(self.text))
+        elif cmd == "back-char":
+            self.cursor = max(self.cursor - 1, 0)
+        elif cmd == "forward-char":
+            self.cursor = min(self.cursor + 1, len(self.text))
+        elif cmd == "start-of-line":
+            self.cursor = start
+        elif cmd == "end-of-line":
+            self.cursor = end
+        elif cmd == "kill-to-start":
+            # At the start of a line it takes the line break, so repeated
+            # presses clear a multi-line prompt line by line.
+            lo = start if self.cursor > start else max(self.cursor - 1, 0)
+            self.killed(self.text[lo:self.cursor], before=True)
+            self.replace(lo, self.cursor)
+        elif cmd == "kill-to-end":
+            hi = end if self.cursor < end else min(self.cursor + 1, len(self.text))
+            self.killed(self.text[self.cursor:hi], before=False)
+            self.replace(self.cursor, hi)
+        elif cmd == "kill-word":
+            # Back to the previous whitespace: a whole path or --flag=value.
+            i = self.cursor
+            while i > 0 and self.text[i - 1] in " \t":
+                i -= 1
+            while i > 0 and self.text[i - 1] not in " \t\n":
+                i -= 1
+            if i == self.cursor and i > 0:
+                i -= 1  # nothing but a line break behind: take it
+            self.killed(self.text[i:self.cursor], before=True)
+            self.replace(i, self.cursor)
+        elif cmd == "paste":
+            self.replace(self.cursor, self.cursor, self.kill)
+        elif cmd == "undo":
+            if self.undo_stack:
+                self.text, self.cursor = self.undo_stack.pop()
+        elif cmd == "stash":
+            if self.text:
+                self.stash = (self.text, self.cursor)
+                self.text, self.cursor = "", 0
+            elif self.stash:
+                self.text, self.cursor = self.stash
+                self.stash = None
+        elif cmd == "esc-esc":
+            if self.text:
+                self.history.append(self.text)
+                self.text, self.cursor = "", 0
+        elif cmd == "up":
+            if self.text.rfind("\n", 0, self.cursor) != -1 and self.hist_at is None:
+                self.move_line(-1)
+            else:
+                self.walk_history(-1)
+        elif cmd == "down":
+            if self.text.find("\n", self.cursor) != -1 and self.hist_at is None:
+                self.move_line(1)
+            else:
+                self.walk_history(1)
+        if cmd not in ("up", "down"):
+            self.hist_at = None
+        self.last = cmd
+
+    def move_line(self, step):
+        start, end = self.line_bounds()
+        col = self.cursor - start
+        if step < 0:
+            pstart = self.text.rfind("\n", 0, start - 1) + 1
+            self.cursor = min(pstart + col, start - 1)
+        else:
+            nstart = end + 1
+            nend = self.text.find("\n", nstart)
+            nend = len(self.text) if nend == -1 else nend
+            self.cursor = min(nstart + col, nend)
+
+    def walk_history(self, step):
+        if not self.history:
+            return
+        if self.hist_at is None:
+            if step > 0:
+                return
+            self.pending = self.text
+            self.hist_at = len(self.history)
+        self.hist_at = max(0, min(self.hist_at + step, len(self.history)))
+        self.text = self.history[self.hist_at] if self.hist_at < len(self.history) else self.pending
+        self.cursor = len(self.text)
+        if self.hist_at == len(self.history):
+            self.hist_at = None
+
+    def match(self):
+        query, skip = self.search
+        found = [h for h in reversed(self.history) if query and query.lower() in h.lower()]
+        return found[min(skip, len(found) - 1)] if found else None
+
+    # ── drawing ───────────────────────────────────────────────────────────
+    def rows(self):
+        """The box as screen rows, and where the cursor sits in them."""
+        inner = self.width - 4
+        text, cursor = self.text, self.cursor
+        if self.search is not None:
+            text, cursor = self.match() or "", None
+        rows, crow, ccol = [], 0, 0
+        offset = 0
+        for n, line in enumerate(text.split("\n")):
+            room = inner - 2
+            chunks = [line[i:i + room] for i in range(0, len(line), room)] or [""]
+            if line and len(line) % room == 0:
+                chunks.append("")
+            for k, chunk in enumerate(chunks):
+                lead = (PINK + "> " + RESET) if (n == 0 and k == 0) else "  "
+                s = offset + k * room
+                last = k == len(chunks) - 1
+                if cursor is not None and s <= cursor and (cursor <= s + len(chunk) if last else cursor < s + room):
+                    crow, ccol = len(rows) + 1, 4 + cursor - s
+                body = (CYAN + chunk + RESET) if self.search is not None else chunk
+                rows.append(BORDER + "│ " + RESET + lead + body + " " * (room - len(chunk)) + BORDER + " │" + RESET)
+            offset += len(line) + 1
+        top = BORDER + "╭" + "─" * (self.width - 2) + "╮" + RESET
+        bottom = BORDER + "╰" + "─" * (self.width - 2) + "╯" + RESET
+        out = [top] + rows + [bottom]
+        if self.search is not None:
+            query = self.search[0]
+            out.append("  " + FAINT + "search prompts: " + RESET + query + REVERSE + " " + RESET
+                       + FAINT + ("   no match" if query and not self.match() else "") + RESET)
+            crow, ccol = len(out) - 1, 2 + len("search prompts: ") + len(query)
+        else:
+            out.append("  " + FAINT + "faux Claude Code prompt · Enter sends · ctrl+c gives up" + RESET)
+        return out, crow, ccol
+
+    def draw(self):
+        out, crow, ccol = self.rows()
+        w = sys.stdout.write
+        if self.cursor_row:
+            w("\x1b[%dA" % self.cursor_row)
+        w("\r\x1b[J")
+        w("\r\n".join(out))
+        up = len(out) - 1 - crow
+        if up:
+            w("\x1b[%dA" % up)
+        w("\r")
+        if ccol:
+            w("\x1b[%dC" % ccol)
+        sys.stdout.flush()
+        self.drawn_rows, self.cursor_row = len(out), crow
+
+    def erase(self):
+        w = sys.stdout.write
+        if self.cursor_row:
+            w("\x1b[%dA" % self.cursor_row)
+        w("\r\x1b[J")
+        sys.stdout.flush()
+        self.cursor_row = 0
+
+    def sent(self, text):
+        """Leaves what was sent above the box, the way the transcript does."""
+        self.erase()
+        lines = text.split("\n") or [""]
+        sys.stdout.write(FAINT + "> " + lines[0] + "".join("\r\n  " + l for l in lines[1:]) + RESET + "\r\n")
+        if text.startswith("/"):
+            sys.stdout.write(FAINT + "  ⎿  " + text.split()[0][1:] + " done" + RESET + "\r\n")
+        sys.stdout.write("\r\n")
+        sys.stdout.flush()
+
+    def run_editor(self, restore):
+        """Ctrl+G: the prompt in $EDITOR; whatever is saved comes back."""
+        self.erase()
+        termios.tcsetattr(0, termios.TCSADRAIN, restore)
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+            f.write(self.text)
+        editor = (os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vim").split()
+        subprocess.call(editor + [f.name])
+        with open(f.name) as f2:
+            self.text = f2.read().rstrip("\n")
+        os.unlink(f.name)
+        self.cursor = len(self.text)
+        tty.setraw(0)
+
+
+def main():
+    spec_path, out_path = sys.argv[1], sys.argv[2]
+    with open(spec_path) as f:
+        spec = json.load(f)
+    p = Prompt(spec)
+    results, aborted = [], False
+    saved = termios.tcgetattr(0)
+    tty.setraw(0)
+    keys = Keys(0)
+    try:
+        for phase in spec["phases"]:
+            if phase.get("label"):
+                sys.stdout.write(FAINT + phase["label"] + RESET + "\r\n")
+            p.text, p.cursor = phase.get("text", ""), phase.get("cursor", len(phase.get("text", "")))
+            p.last, p.hist_at = None, None
+            count, used = 0, []
+            p.draw()
+            while True:
+                cmd, arg = keys.next()
+                if cmd == "abort":
+                    aborted = True
+                    break
+                if p.search is not None:
+                    count += 1
+                    query, skip = p.search
+                    if cmd == "insert":
+                        p.search = (query + arg, 0)
+                    elif cmd == "backspace":
+                        p.search = (query[:-1], 0)
+                    elif cmd == "search":
+                        p.search = (query, skip + 1)
+                    elif cmd == "submit":
+                        found = p.match()
+                        p.search = None
+                        if found is not None:
+                            p.snapshot()
+                            p.text, p.cursor = found, len(found)
+                    elif cmd in ("esc", "esc-esc"):
+                        p.search = None
+                    p.draw()
+                    continue
+                if cmd == "submit":
+                    results.append({"text": p.text, "keys": count, "used": used})
+                    p.history.append(p.text)
+                    p.sent(p.text)
+                    p.undo_stack = []
+                    break
+                count += 1
+                used.append(cmd if cmd != "insert" else "type")
+                if cmd == "search":
+                    p.search = ("", 0)
+                elif cmd == "editor":
+                    p.run_editor(saved)
+                elif cmd not in ("esc", "unknown"):
+                    p.do(cmd, arg)
+                p.draw()
+            if aborted:
+                p.erase()
+                break
+    finally:
+        termios.tcsetattr(0, termios.TCSADRAIN, saved)
+    with open(out_path, "w") as f:
+        json.dump({"aborted": aborted, "phases": results}, f)
+
+
+if __name__ == "__main__":
+    main()

@@ -91,6 +91,80 @@ class KeysCards(unittest.TestCase):
                     self.assertNotEqual(srs.norm(p["text"]), srs.norm(p["goal"]), (tid, seed))
 
 
+def type_into_ccprompt(card, editor=None):
+    """Runs srs-ccprompt on a card, types each phase's route at a person's
+    pace — Esc Esc as two presses, not one burst — then Enter. Returns
+    [(text, keystrokes, used)] per phase."""
+    import json
+    work = tempfile.mkdtemp()
+    spec_path, out_path = os.path.join(work, "spec.json"), os.path.join(work, "out.json")
+    with open(spec_path, "w") as f:
+        json.dump({"phases": [{"text": p["text"]} for p in card["phases"]],
+                   "history": card.get("history", []), "undo": card.get("undo", []),
+                   "kill": card.get("kill", "")}, f)
+    pid, fd = pty.fork()
+    if pid == 0:
+        if editor:
+            os.environ["EDITOR"] = editor
+        os.execv(os.path.join(BIN, "srs-ccprompt"), [os.path.join(BIN, "srs-ccprompt"), spec_path, out_path])
+    seen = b""
+
+    def pump(seconds, until=None):
+        nonlocal seen
+        end = time.time() + seconds
+        while time.time() < end:
+            if until and until in seen:
+                return
+            if select.select([fd], [], [], 0.02)[0]:
+                try:
+                    seen += os.read(fd, 65536)
+                except OSError:
+                    return
+
+    pump(5, until="╭".encode())
+    for p in card["phases"]:
+        for ch in p["route"]:
+            os.write(fd, {"↑": b"\x1b[A"}.get(ch, ch.encode()))
+            pump(0.15 if ch == "\x1b" else 0.04)
+        pump(0.5 if ch == "\x07" else 0.05)
+        os.write(fd, b"\r")
+        pump(0.25)
+    os.waitpid(pid, 0)
+    os.close(fd)
+    with open(out_path) as f:
+        out = json.load(f)
+    shutil.rmtree(work)
+    return [(r["text"], r["keys"], r["used"]) for r in out["phases"]]
+
+
+class ClaudeCodeCards(unittest.TestCase):
+    def test_par_route_reaches_the_goal_in_par(self):
+        for tid, t in srs.CC.templates.items():
+            for seed in range(4):
+                card = t.gen(random.Random(seed))
+                editor = None
+                if tid == "editor":
+                    editor = os.path.join(tempfile.mkdtemp(), "add-line")
+                    with open(editor, "w") as f:
+                        f.write("#!/bin/sh\nprintf '\\n%s\\n' '" + card["phases"][0]["goal"].split("\n")[-1]
+                                + "' >> \"$1\"\n")
+                    os.chmod(editor, 0o755)
+                with self.subTest(template=tid, seed=seed):
+                    results = type_into_ccprompt(card, editor)
+                    for p, (text, keys, used) in zip(card["phases"], results):
+                        self.assertEqual(srs.cc_norm(text), srs.cc_norm(p["goal"]))
+                        if p["par"] is None:
+                            self.assertIn(p["require"], used)
+                        else:
+                            self.assertEqual(keys, p["par"])
+
+    def test_the_goal_is_never_already_done(self):
+        for tid, t in srs.CC.templates.items():
+            for seed in SEEDS:
+                for p in t.gen(random.Random(seed))["phases"]:
+                    self.assertNotEqual(srs.cc_norm(p["text"]), srs.cc_norm(p["goal"]), (tid, seed))
+
+
 @unittest.skipUnless(srs.duckdb_path(), "duckdb not installed")
 class LateralCards(unittest.TestCase):
     def setUp(self):
@@ -167,19 +241,26 @@ class Lessons(unittest.TestCase):
 
 
 class NextModule(unittest.TestCase):
-    def test_offers_the_other_module_with_cards_due(self):
+    def test_offers_the_other_module_with_the_most_due(self):
         state = srs.with_defaults({})
-        self.assertEqual(srs.next_module(state, "keys", now=1), ("lateral", len(srs.LATERAL.templates)))
+        most = max((m for m in srs.MODULES if m != "keys"), key=lambda m: len(srs.MODULES[m].templates))
+        self.assertEqual(srs.next_module(state, "keys", now=1), (most, len(srs.MODULES[most].templates)))
 
     def test_offers_practice_when_nothing_else_is_due(self):
         state = srs.with_defaults({})
-        for c in state["modules"]["lateral"]["cards"].values():
-            c.update(seen=1, box=1, due=10 ** 12)
-        self.assertEqual(srs.next_module(state, "keys", now=1), ("lateral", 0))
+        for m in srs.MODULES:
+            if m != "keys":
+                for c in state["modules"][m]["cards"].values():
+                    c.update(seen=1, box=1, due=10 ** 12)
+        offered, due = srs.next_module(state, "keys", now=1)
+        self.assertNotEqual(offered, "keys")
+        self.assertEqual(due, 0)
 
     def test_paused_modules_are_not_offered(self):
         state = srs.with_defaults({})
-        state["modules"]["lateral"]["active"] = False
+        for m in srs.MODULES:
+            if m != "keys":
+                state["modules"][m]["active"] = False
         self.assertIsNone(srs.next_module(state, "keys", now=1))
 
 

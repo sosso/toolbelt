@@ -36,6 +36,27 @@ In zsh `^U` is `kill-whole-line` — it wipes the line wherever the cursor is �
 not readline's "delete to the start of the line". The cards teach zsh's.
 `^Y` yanks only the most recent kill; zsh doesn't merge two kills in a row.
 
+**Claude Code prompt** — the keys of Claude Code's own input box, which is not
+your shell: `^U` cuts only back to the start of the line and `^W` back to the
+last space, and there are keys a shell doesn't have for never losing a prompt.
+Drilled in `srs-ccprompt`, a stand-in for the box built from Claude Code's
+[interactive-mode docs](https://code.claude.com/docs/en/interactive-mode);
+where the docs leave a detail open the lesson says so, so check it once in the
+real thing.
+
+| Card | Par route |
+|------|-----------|
+| Stash and restore | `^S`, run `/compact`, `^S` |
+| Clear, keep the draft | `Esc Esc`, run a command, `↑ ↑` |
+| Undo | `^_` |
+| New line, not send | `^J` |
+| Cut back to the space | `^W` — a whole path or flag |
+| Move a line | `^U ⌫ ^A ^Y ^J` |
+| Finish it in your editor | `^G` |
+| Find an old prompt | `^R`, a word, `⏎` |
+
+![Stash a long prompt with ^S, run /status, restore it with ^S](docs/images/cc-stash.webp)
+
 **Lateral joins** — SQLite has no `LATERAL` (a syntax error even in 3.51), so
 these run on [DuckDB](https://duckdb.org). Each card is a small database and the
 exact output to produce from it; you write the query in `$EDITOR` (vim if

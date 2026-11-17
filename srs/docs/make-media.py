@@ -20,6 +20,7 @@ import select
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -309,13 +310,36 @@ def sql_card(srs):
     t.close()
 
 
+def cc_stash(srs):
+    """Claude Code's prompt: a long prompt stashed with ^S, /compact run,
+    the prompt restored with ^S."""
+    t = Terminal([SRS, "run", "cc"], {"SRS_HOME": home_with(srs, only_due("cc", "stash"))}, rows=30)
+    t.pump(1.5)
+    card = srs.CC.templates["stash"].gen(srs.random.Random(int(SEED)))
+    t.frame(3500)
+    first, restore = card["phases"]
+    t.type("\x13", hold=1400)
+    t.type(first["route"][1:], every=2, gap=0.04, hold=110)
+    t.frame(600)
+    t.key("\r", 0.6)
+    t.frame(1400)
+    t.type("\x13", hold=1600)
+    t.key("\r", 0.9)
+    t.frame(5000)
+    t.animation("cc-stash")
+    t.close()
+
+
+SCENES = {"first-contact": first_contact, "stash": stash_card, "lateral": lateral, "sql": sql_card,
+          "cc-stash": cc_stash}
+
+
 def main():
+    """make-media.py [SCENE ...] — every scene by default."""
     os.makedirs(IMAGES, exist_ok=True)
     srs = load_srs()
-    first_contact(srs)
-    stash_card(srs)
-    lateral(srs)
-    sql_card(srs)
+    for name in sys.argv[1:] or SCENES:
+        SCENES[name](srs)
 
 
 if __name__ == "__main__":

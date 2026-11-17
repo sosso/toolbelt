@@ -236,7 +236,9 @@ def running_pid():
 # card exists to teach — retyping the line gets the text right and blows par.
 # Spacing is normalised before comparing, because the shell ignores it too.
 
-KEY_NAMES = {"\x01": "^A", "\x05": "^E", "\x0b": "^K", "\x15": "^U", "\x19": "^Y", "\r": "⏎"}
+KEY_NAMES = {"\x01": "^A", "\x05": "^E", "\x0b": "^K", "\x15": "^U", "\x19": "^Y", "\r": "⏎",
+             "\x13": "^S", "\x1f": "^_", "\n": "^J", "\x17": "^W", "\x07": "^G", "\x12": "^R",
+             "\x7f": "⌫", "\x1b": "Esc", "↑": "↑"}
 
 COMMANDS = [
     "git log --oneline --graph --decorate --all",
@@ -605,6 +607,422 @@ KEYS = Module(
     run_card=run_keys_card,
     teach=teach_keys,
     primer=KEYS_PRIMER,
+)
+
+
+# ── Claude Code prompt ──────────────────────────────────────────────────────
+#
+# Drilled in srs-ccprompt, a stand-in for Claude Code's input box built from
+# its interactive-mode docs. Its editing differs from zsh's: Ctrl+U cuts only
+# back to the start of the line and Ctrl+W back to the last space, and it adds
+# keys a shell doesn't have — stash, drafts, undo, the external editor.
+
+CC_PROMPTS = [
+    "Refactor the search filters to use the new query builder and keep the URL params backwards compatible",
+    "Find out why the nightly export job is timing out and propose a fix with a test",
+    "Add pagination to the saved searches endpoint and update the API docs to match",
+    "Write a migration that backfills listing_status for archived rows in batches of 1000",
+    "Review this branch for N+1 queries and missing indexes before I open the PR",
+    "Port the date helpers from moment to date-fns without changing any formatted output",
+    "Explain how the session cookie gets refreshed, then add logging around the refresh path",
+    "Split the 900-line ListingCard component into smaller pieces without changing its props",
+]
+CC_CONSTRAINTS = [
+    "Don't touch the public API.", "Keep the diff small.", "Run the specs before you stop.",
+    "Ask before deleting anything.", "No new dependencies.", "Leave the CSV column order alone.",
+]
+CC_SLASH = ["/compact", "/context", "/model", "/status", "/cost"]
+CC_STEPS = [
+    ("First, run the test suite and note anything red.", "Then fix the failures one file at a time."),
+    ("First, read the existing migration helpers.", "Then write the backfill using them."),
+    ("First, reproduce the timeout locally.", "Then profile the slowest query."),
+    ("First, list every caller of the old helper.", "Then replace them in one commit."),
+    ("First, check which flags are still read anywhere.", "Then delete the dead ones."),
+]
+CC_PLANS = [
+    ("Plan for the export rewrite:", ["Stream rows instead of loading them all", "Write the CSV in chunks",
+                                      "Upload to S3 as a multipart upload"]),
+    ("Before merging the search branch:", ["Rebase on master", "Run the full spec suite",
+                                           "Check the query plan for the new filter"]),
+    ("Cleanup for the auth module:", ["Remove the legacy token check", "Inline the one-use helpers",
+                                      "Add tests for expired refresh tokens"]),
+]
+CC_TAILS = [
+    ("Run the specs in", "spec/models/listing_spec.rb", "spec/models/agent_spec.rb"),
+    ("Look at the failing test in", "app/jobs/nightly_export_job.rb", "app/jobs/sitemap_job.rb"),
+    ("Summarise the changes to", "config/initializers/session_store.rb", "config/routes.rb"),
+    ("Explain what goes wrong in", "src/components/SearchBar/Filters.tsx", "src/hooks/useSavedSearch.ts"),
+]
+CC_FLAGS = ["--fail-fast", "--verbose", "--no-cache", "--dry-run", "--watch=false"]
+CC_HISTORY = [
+    ("flaky", "Why is the checkout spec flaky on CI but green locally?"),
+    ("webhook", "Retry failed Stripe webhook deliveries with exponential backoff"),
+    ("sitemap", "Generate the sitemap in a background job instead of on deploy"),
+    ("rubocop", "Fix every rubocop offence in app/services without changing behaviour"),
+    ("tailwind", "Move the remaining inline styles in the header to tailwind classes"),
+    ("memoize", "Memoize the expensive price formatting in the listing table"),
+    ("dockerfile", "Make the dockerfile build cache the bundle install layer"),
+    ("cron", "Why did the cron for the weekly digest run twice on Monday?"),
+]
+
+
+def cc_norm(text):
+    """Spacing within a line doesn't matter; line breaks do."""
+    lines = [" ".join(line.split()) for line in text.split("\n")]
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)
+
+
+def cc_stash(rng):
+    prompt = rng.choice(CC_PROMPTS)
+    if rng.random() < 0.5:
+        prompt += "\n" + rng.choice(CC_CONSTRAINTS)
+    cmd = rng.choice(CC_SLASH)
+    return {
+        "brief": "You've written a long prompt and want to run %s before sending it. Stash the prompt,\n"
+                 "run the command, then bring the prompt back — every line of it." % cmd,
+        "phases": [
+            {"text": prompt, "goal": cmd, "par": 1 + len(cmd), "route": "\x13" + cmd, "label": "run first"},
+            {"text": "", "goal": prompt, "par": 1, "route": "\x13", "label": "then restore"},
+        ],
+        "solution": "^S stashes the whole prompt and clears the box; ^S again on the empty box restores it.",
+    }
+
+
+def cc_draft(rng):
+    prompt = rng.choice(CC_PROMPTS)
+    cmd = rng.choice(["/context", "/status", "/cost"])
+    older = rng.sample([p for _, p in CC_HISTORY], 2)
+    return {
+        "brief": "Clear this prompt without losing it, run %s, then get the prompt back from history." % cmd,
+        "phases": [
+            {"text": prompt, "goal": cmd, "par": 2 + len(cmd), "route": "\x1b\x1b" + cmd, "label": "clear, run"},
+            {"text": "", "goal": prompt, "par": 2, "route": "↑↑", "label": "then recover"},
+        ],
+        "history": older,
+        "solution": "Esc Esc clears the box and saves the draft to history. %s went in after it, so it's "
+                    "two ↑ back." % cmd,
+    }
+
+
+def cc_undo(rng):
+    prompt = rng.choice(CC_PROMPTS)
+    words = prompt.split(" ")
+    cut = len(" ".join(words[:rng.randint(3, len(words) - 3)]))
+    return {
+        "brief": "You reached for ^E and hit ^K: everything after the cursor is gone. Put it back.",
+        "phases": [{"text": prompt[:cut], "goal": prompt, "par": 1, "route": "\x1f"}],
+        "undo": [[prompt, cut]],
+        "kill": prompt[cut:],
+        "solution": "^_ undoes the last edit. (^Y works here too — ^K saved what it cut.)",
+    }
+
+
+def cc_newline(rng):
+    first = rng.choice(CC_PROMPTS)
+    second = rng.choice(CC_CONSTRAINTS)
+    return {
+        "brief": "Add a second line to the prompt without sending it.",
+        "phases": [{"text": first, "goal": first + "\n" + second, "par": 1 + len(second),
+                    "route": "\n" + second}],
+        "solution": "^J is a newline in any terminal. Enter would have sent the first line on its own.",
+    }
+
+
+def cc_chop(rng):
+    lead, path, other = rng.choice(CC_TAILS)
+    if rng.random() < 0.5:
+        flag = rng.choice(CC_FLAGS)
+        text, goal, route = "%s %s %s" % (lead, path, flag), "%s %s" % (lead, path), "\x17"
+        brief = "Drop the %s flag from the end." % flag
+    else:
+        text, goal, route = "%s %s" % (lead, path), "%s %s" % (lead, other), "\x17" + other
+        brief = "Wrong file. Swap the path at the end for %s." % other
+    return {
+        "brief": brief,
+        "phases": [{"text": text, "goal": goal, "par": len(route), "route": route}],
+        "solution": "^W deletes back to the previous space — the whole path or flag in one press, "
+                    "unlike zsh's ^W, which stops at every / and -.",
+    }
+
+
+def cc_reorder(rng):
+    first, then = rng.choice(CC_STEPS)
+    return {
+        "brief": "The two steps are in the wrong order. Swap the lines without retyping either.",
+        "phases": [{"text": then + "\n" + first, "goal": first + "\n" + then, "par": 5,
+                    "route": "\x15\x7f\x01\x19\n"}],
+        "solution": "^U cuts the line back to its start, ⌫ removes the empty line, ^A goes to the start of "
+                    "the first line, ^Y pastes, ^J breaks the line.",
+    }
+
+
+def cc_editor(rng):
+    title, steps = rng.choice(CC_PLANS)
+    text = title + "\n" + "\n".join("%d. %s" % (i + 1, s) for i, s in enumerate(steps[:2]))
+    goal = text + "\n3. " + steps[2]
+    return {
+        "brief": "Add step 3 — \"%s\" — in your editor, where a long prompt is easier to work on." % steps[2],
+        "phases": [{"text": text, "goal": goal, "par": None, "require": "editor", "route": "\x07"}],
+        "solution": "^G opens the prompt in $EDITOR; save and quit and the box has your edit. "
+                    "(^J would get the text right, but the drill is the editor.)",
+    }
+
+
+def cc_search(rng):
+    picks = rng.sample(CC_HISTORY, 6)
+    keyword, target = picks[rng.randint(0, 3)]  # not the latest — Up won't reach it in one
+    return {
+        "brief": "A while ago you asked Claude about \"%s\". Find that prompt and send it again." % keyword,
+        "phases": [{"text": "", "goal": target, "par": 2 + len(keyword), "route": "\x12" + keyword + "\r"}],
+        "history": [p for _, p in picks],
+        "solution": "^R searches past prompts as you type; ⏎ puts the match in the box, ⏎ again sends it.",
+    }
+
+
+def edit_cc(card):
+    """Runs a card's phases in srs-ccprompt. [(text, keys, used)] or None."""
+    spec = {"phases": [{"text": p["text"], "cursor": p.get("cursor", len(p["text"])),
+                        "label": p.get("label", "") if len(card["phases"]) > 1 else ""}
+                       for p in card["phases"]],
+            "history": card.get("history", []), "undo": card.get("undo", []), "kill": card.get("kill", "")}
+    work = tempfile.mkdtemp(prefix="srs-cc.")
+    spec_path, out_path = os.path.join(work, "spec.json"), os.path.join(work, "out.json")
+    with open(spec_path, "w") as f:
+        json.dump(spec, f)
+    drain_input()
+    subprocess.call([os.path.join(HERE, "srs-ccprompt"), spec_path, out_path])
+    try:
+        with open(out_path) as f:
+            out = json.load(f)
+    except (OSError, ValueError):
+        out = {"aborted": True}
+    shutil.rmtree(work, ignore_errors=True)
+    if out.get("aborted") or len(out.get("phases", [])) < len(card["phases"]):
+        return None
+    return [(r["text"], r["keys"], r["used"]) for r in out["phases"]]
+
+
+def show_cc_goals(card):
+    for p in card["phases"]:
+        label = p.get("label", "goal")
+        goal = p["goal"].split("\n")
+        print("  %s %s" % (FAINT(label.ljust(13)), CYAN(goal[0])))
+        for line in goal[1:]:
+            print("  %s %s" % (" " * 13, CYAN(line)))
+    pars = [keystrokes(p["par"]) if p["par"] is not None else "use " + render_route(p["route"])
+            for p in card["phases"]]
+    print("  %s %s" % (FAINT("par".ljust(13)), " then ".join(pars)))
+    print()
+
+
+def teach_cc(template, rng):
+    show_lesson(template.lesson)
+    card = template.gen(rng)
+    print(BOLD("Try it") + FAINT(" — not graded, take as many goes as you like"))
+    print("  " + card["brief"].replace("\n", "\n  "))
+    show_cc_goals(card)
+    print("  %s %s" % (FAINT("press".ljust(13)),
+                       "   then   ".join(PINK(render_route(p["route"])) + FAINT(" ⏎") for p in card["phases"])))
+    print()
+    for attempt in range(5):
+        results = edit_cc(card)
+        if results is None:
+            return
+        wrong = [(p, text) for p, (text, _, _) in zip(card["phases"], results) if cc_norm(text) != cc_norm(p["goal"])]
+        if not wrong:
+            print(GREEN("  ✓ that's the move") + "\n")
+            return
+        for p, text in wrong:
+            print("  %s you sent  %s" % (YELLOW("not quite —"), text.replace("\n", " ⏎ ")))
+        print(FAINT("  again, pressing exactly: ") +
+              "   then   ".join(PINK(render_route(p["route"])) for p in card["phases"]) + "\n")
+    print(FAINT("  moving on — it'll come back round") + "\n")
+
+
+def run_cc_card(template, rng):
+    card = template.gen(rng)
+    print(card["brief"])
+    print()
+    show_cc_goals(card)
+    results = edit_cc(card)
+    if results is None:
+        print(FAINT("\n  skipped"))
+        return None
+    grades = []
+    for p, (text, keys, used) in zip(card["phases"], results):
+        right = cc_norm(text) == cc_norm(p["goal"])
+        if p["par"] is None:
+            on_par = p["require"] in used
+            score = "with %s" % render_route(p["route"]) if on_par else "without %s" % render_route(p["route"])
+        else:
+            on_par = keys <= p["par"]
+            score = "%s, par %d" % (keystrokes(keys), p["par"])
+        if right and on_par:
+            grades.append("perfect")
+            print("  %s %s" % (GREEN("✓ perfect"), score))
+        elif right:
+            grades.append("ok")
+            print("  %s %s" % (YELLOW("✓ right, the long way:"), score))
+        else:
+            grades.append("miss")
+            print("  %s sent     %s" % (RED("✗"), text.replace("\n", " ⏎ ")))
+            print("    wanted   %s" % p["goal"].replace("\n", " ⏎ "))
+    print("\n  " + FAINT("par: ") + "   ⏎   ".join(PINK(render_route(p["route"])) for p in card["phases"]))
+    print("  " + FAINT("how: ") + wrapped(card["solution"], 90).replace("\n", "\n       "))
+    for g in ("miss", "ok"):
+        if g in grades:
+            return g
+    return "perfect"
+
+
+CC_PRIMER = """
+# Claude Code's prompt box
+The box you type into in Claude Code is its own editor, not your shell. It
+borrows the emacs-style keys — ^A ^E to the line's ends, ^K ^U ^W to cut,
+^Y to paste back what you cut — and adds keys a shell doesn't have for not
+losing a prompt. These cards drill them in a stand-in built from Claude
+Code's docs (code.claude.com/docs/en/interactive-mode), so practise here and
+the real box will feel familiar.
+
+# Where it differs from your zsh
+    ^U   cuts back to the start of the line (zsh: the whole line)
+         — on a multi-line prompt, press again to take the line break
+    ^W   cuts back to the previous space: a whole path or --flag=value
+         (zsh: stops at every / . -)
+
+# The keys a shell doesn't have
+    ^S        stash the prompt; ^S on the empty box brings it back
+    Esc Esc   clear the prompt, keeping it in history for ↑
+    ^_        undo the last edit
+    ^J        a new line, without sending
+    ^G        open the prompt in $EDITOR
+    ^R        search the prompts you've sent
+
+On a Mac, ⌥ shortcuts such as ⌥Y need the terminal to send Option as Meta.
+None of these cards use one.
+"""
+
+LESSON_CC_STASH = """
+# ^S — stash the prompt, and get it back
+Halfway through a long prompt you need to run something else first —
+/compact, /model, a quick question. ^S puts the whole prompt aside and
+clears the box, however many lines it has. Run what you need. Then ^S again
+on the empty box and it's all back: text, cursor, pasted content.
+
+    a long, multi-line prompt …
+    ^S          the box is empty, the prompt is stashed
+    /compact ⏎  runs
+    ^S          the prompt is back, every line
+
+^U and ^Y can do the same for one line; ^S does the whole prompt in one key.
+"""
+
+LESSON_CC_DRAFT = """
+# Esc Esc — clear it but keep it
+Esc twice on a prompt with text clears the box and saves what was there to
+history, so ↑ brings it back. History is newest first: anything you send
+after clearing lands in front of the draft, so it's one ↑ per prompt sent
+since.
+
+    a prompt you're not ready to send
+    Esc Esc       cleared, saved to history
+    /context ⏎    runs — and is now the newest entry
+    ↑ ↑           the second step back is your draft
+
+On an empty box, Esc Esc does something else entirely — it opens the rewind
+menu.
+"""
+
+LESSON_CC_UNDO = """
+# ^_ — undo
+Control and underscore (on most keyboards ^⇧-) undoes the last change to the
+prompt — a cut, a paste, a burst of typing — and puts the cursor back where it
+was. Press it again to go further back.
+
+    Fix the export job and add a test         you meant ^E …
+    ^K                                        … and cut everything
+    ^_    →   Fix the export job and add a test
+"""
+
+LESSON_CC_NEWLINE = """
+# ^J — a new line without sending
+Enter sends. To keep writing on a new line, ^J — it works in every terminal
+with no setup. (So does ending a line with \\ then Enter.)
+
+    Fix the failing export job.
+    ^J  then type:  Keep the diff small.
+"""
+
+LESSON_CC_CHOP = """
+# ^W — cut back to the last space
+In Claude Code, ^W cuts back to the previous space, so a path or a
+--flag=value goes in one press. That's bash's ^W, not your zsh's, which
+stops at every / and -.
+
+    Run the specs in spec/models/listing_spec.rb --fail-fast
+    ^W   →   Run the specs in spec/models/listing_spec.rb
+    ^W   →   Run the specs in
+
+What ^W cut, ^Y pastes back.
+"""
+
+LESSON_CC_REORDER = """
+# Moving a line: ^U, then ^Y
+^U cuts from the cursor back to the start of the line — just that line.
+Pressed at the very start of a line it takes the line break instead, which
+joins the line to the one above. With ^A, ^Y and ^J that's enough to move a
+line:
+
+    Then fix the failures.
+    First, run the tests.        cursor at the end
+    ^U    cuts "First, run the tests."
+    ⌫     removes the now-empty line
+    ^A    start of "Then fix the failures."
+    ^Y    pastes the cut line there
+    ^J    breaks the line after it
+"""
+
+LESSON_CC_EDITOR = """
+# ^G — finish the prompt in your editor
+For a prompt with structure — a plan, a list, pasted code — ^G opens it in
+$EDITOR (vim if that isn't set). Edit as much as you like; save and quit, and
+the box holds the result, ready to send. (^X ^E does the same.)
+
+    in vim:   o  to open a line below, type it, Esc, :wq
+"""
+
+LESSON_CC_SEARCH = """
+# ^R — search the prompts you've sent
+^R opens a search over your prompt history. Type any part of the prompt; the
+newest match shows as you type. ^R again steps to an older match. ⏎ puts it
+in the box — and ⏎ again sends it.
+
+    ^R  flaky  ⏎  ⏎   sends "Why is the checkout spec flaky on CI …" again
+
+In real Claude Code, ^S inside the search switches between this session,
+this project and all projects. The docs don't spell out whether ⏎ there sends
+straight away or fills the box first; here it fills the box — check it once
+in the real thing.
+"""
+
+CC = Module(
+    "Claude Code prompt",
+    {
+        "stash": Template("Stash and restore", cc_stash, LESSON_CC_STASH),
+        "draft": Template("Clear, keep the draft", cc_draft, LESSON_CC_DRAFT),
+        "undo": Template("Undo", cc_undo, LESSON_CC_UNDO),
+        "newline": Template("New line, not send", cc_newline, LESSON_CC_NEWLINE),
+        "chop": Template("Cut back to the space", cc_chop, LESSON_CC_CHOP),
+        "reorder": Template("Move a line", cc_reorder, LESSON_CC_REORDER),
+        "editor": Template("Finish it in your editor", cc_editor, LESSON_CC_EDITOR),
+        "search": Template("Find an old prompt", cc_search, LESSON_CC_SEARCH),
+    },
+    session_size=3,
+    run_card=run_cc_card,
+    teach=teach_cc,
+    primer=CC_PRIMER,
 )
 
 
@@ -1428,7 +1846,7 @@ LATERAL = Module(
     primer=LATERAL_PRIMER,
 )
 
-MODULES = {"keys": KEYS, "lateral": LATERAL}
+MODULES = {"keys": KEYS, "cc": CC, "lateral": LATERAL}
 
 
 # ── commands ────────────────────────────────────────────────────────────────
