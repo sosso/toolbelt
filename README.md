@@ -10,6 +10,7 @@ Small macOS utilities, each in its own directory with an `install.sh`.
 | [`flow-mic`](flow-mic/) | launchd daemon that saves/restores a mic's hardware mute state around Wispr Flow dictations: unmutes when recording starts, restores your previous state when it stops. |
 | [`audio-switch`](audio-switch/) | Output-device switching scripts (receiver ↔ built-in speakers) with silent applet wrappers for Stream Deck dock/undock multi-actions. |
 | [`ghostty-split`](ghostty-split/) | Splits the focused Ghostty pane 50/50 downward and starts a Claude Code session in it, in the same working directory. Driven by a Shortcuts.app hotkey. |
+| [`srs`](srs/) | Spaced-repetition drills that pop up from the menu bar at random — terminal line editing in real zsh, lateral joins against DuckDB — with Leitner boxes, a daily streak and graduation. Holds off while a Focus is on. |
 | [`hammerspoon`](hammerspoon/) | Menu bar item for your open pull requests, bucketed by whether they can actually merge — CI state, conflicts, review — from one `gh` GraphQL call. Plus the Dracula-themed styling library it is built on. |
 
 ## Install

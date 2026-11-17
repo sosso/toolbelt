@@ -34,6 +34,7 @@ for key, name in pairs({
   fleet = "rsv2_fleet",
   flowMic = "flow_mic",
   blackout = "blackout",
+  srs = "srs",
 }) do
   local module = optionalModule(name)
   if module then menus[key] = module end

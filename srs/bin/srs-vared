@@ -1,0 +1,66 @@
+#!/bin/zsh -f
+# Edits lines with zsh's real line editor and reports what happened, so the
+# terminal-editing cards drill the exact bindings your shell has rather than an
+# imitation of them.
+#
+#   srs-vared OUTFILE CURSOR TEXT HINT [CURSOR TEXT HINT ...]
+#
+# Each CURSOR/TEXT/HINT triple is one line to edit: TEXT is loaded with the
+# cursor at character CURSOR, HINT is printed above it. Every line is edited in
+# this one process, so the kill ring carries from one line to the next — that is
+# what lets a card stash a line with ^U on the first and yank it back on the
+# second.
+#
+# OUTFILE gets three lines per edited line: the final text, the number of
+# keystrokes, and the editing commands used. Ctrl-C writes "aborted" instead.
+emulate -L zsh
+setopt no_beep
+
+local out=$1; shift
+: >| $out
+
+# zsh's own emacs keymap, untouched — ^U is kill-whole-line, as in your shell.
+bindkey -e
+bindkey -r '^I'
+
+typeset -gi SRS_KEYS=0
+typeset -ga SRS_USED
+
+# Every bound command is wrapped once, so whatever key you reach for counts.
+# Enter is left alone: it ends the line rather than editing it.
+_srs_count() {
+  (( SRS_KEYS++ ))
+  SRS_USED+=($WIDGET)
+  zle .$WIDGET
+}
+local w
+for w in ${(u)${${(f)"$(bindkey -M emacs)"}##* }}; do
+  case $w in
+    accept-*|send-break|undefined-key|_srs_*) ;;
+    *) zle -N $w _srs_count ;;
+  esac
+done
+
+TRAPINT() {
+  print aborted >> $out
+  exit 130
+}
+
+local cursor text hint line
+while (( $# >= 3 )); do
+  cursor=$1 text=$2 hint=$3; shift 3
+  SRS_KEYS=0 SRS_USED=()
+  [[ -n $hint ]] && print -P -- "$hint"
+
+  line=$text
+  # vared has no flag for where the cursor starts, so it is moved there by a
+  # one-shot zle-line-init that removes itself.
+  _srs_place() { CURSOR=$SRS_CURSOR; zle -D zle-line-init 2>/dev/null; }
+  typeset -g SRS_CURSOR=$cursor
+  zle -N zle-line-init _srs_place
+  vared -p '%F{magenta}$%f ' line
+
+  print -r -- $line >> $out
+  print -r -- $SRS_KEYS >> $out
+  print -r -- "${SRS_USED[*]}" >> $out
+done

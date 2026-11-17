@@ -26,6 +26,7 @@ xcode-select -p >/dev/null 2>&1 || { echo "Xcode Command Line Tools required (xc
 ./keysend/install.sh
 ./blackout/install.sh
 ./flow-mic/install.sh
+./srs/install.sh
 if [ -x /opt/homebrew/bin/SwitchAudioSource ]; then
   ./audio-switch/install.sh
 else

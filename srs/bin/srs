@@ -1,0 +1,1246 @@
+#!/usr/bin/python3
+"""srs — spaced-repetition drills that pop up from the menu bar.
+
+Every card is generated fresh from a template each time it comes up, so what
+you learn is the move rather than the answer. Progress is tracked per template
+in Leitner boxes: a perfect answer moves a template up a box and pushes its
+next review further out, anything less sends it back. A template that is
+answered perfectly from the last box graduates, and a module graduates once
+every template in it has.
+
+  srs status [--json]       what is due, streaks, progress
+  srs pick                  the one module the next popup should quiz
+  srs run [MODULE] [--popup] [--practice]
+  srs snooze MINUTES        hold popups
+  srs toggle MODULE         pause or resume a module
+  srs reset MODULE          forget a module's progress
+
+State lives in ~/.local/share/srs (or $SRS_HOME).
+"""
+import datetime
+import json
+import os
+import random
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+HOME = os.environ.get("SRS_HOME") or os.path.expanduser("~/.local/share/srs")
+STATE_PATH = os.path.join(HOME, "state.json")
+LOCK_PATH = os.path.join(HOME, "running.pid")
+
+DAY = 86400
+# Days until the next review after a perfect answer lands a template in box b.
+# A perfect answer in the last box graduates it, so the shortest road to
+# graduation is six perfects across roughly two months.
+BOX_DAYS = [0, 1, 3, 7, 14, 30]
+LAST_BOX = len(BOX_DAYS) - 1
+MISS_RETRY = 10 * 60
+HISTORY_KEEP = 30
+
+
+# ── terminal ────────────────────────────────────────────────────────────────
+
+def _c(code):
+    return lambda s: "\033[%sm%s\033[0m" % (code, s)
+
+# Dracula, as 24-bit escapes, to match the menu bar.
+PINK = _c("38;2;255;121;198")
+PURPLE = _c("38;2;189;147;249")
+CYAN = _c("38;2;139;233;253")
+GREEN = _c("38;2;80;250;123")
+YELLOW = _c("38;2;241;250;140")
+ORANGE = _c("38;2;255;184;108")
+RED = _c("38;2;255;85;85")
+FAINT = _c("38;2;98;114;164")
+BOLD = _c("1")
+
+
+def clear():
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
+def drain_input():
+    """Throws away keys typed before the prompt appeared — a popup steals the
+    keyboard mid-sentence, and the next Return should not start a quiz."""
+    try:
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except (termios.error, ValueError, OSError):
+        pass
+
+
+def ask(prompt, choices):
+    """Reads one line and returns the first choice it matches; Return picks
+    the first choice."""
+    while True:
+        try:
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            return choices[-1]
+        if answer == "":
+            return choices[0]
+        for c in choices:
+            if answer == c or answer == c[0]:
+                return c
+
+
+def meter(box, graduated=False):
+    if graduated:
+        return GREEN("▰" * (LAST_BOX + 1))
+    return PURPLE("▰" * box) + FAINT("▱" * (LAST_BOX + 1 - box))
+
+
+# ── state ───────────────────────────────────────────────────────────────────
+
+def today(now=None):
+    return datetime.date.fromtimestamp(now or time.time())
+
+
+def load_state():
+    try:
+        with open(STATE_PATH) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    return with_defaults(state)
+
+
+def with_defaults(state):
+    """Fills in whatever a state file lacks — a fresh install, a module added
+    since, or one just reset."""
+    state.setdefault("version", 1)
+    state.setdefault("modules", {})
+    state.setdefault("streak", {"days": 0, "best": 0, "last_day": None})
+    state.setdefault("snooze_until", 0)
+    for module_id in MODULES:
+        m = state["modules"].setdefault(module_id, {})
+        m.setdefault("active", True)
+        m.setdefault("graduated_at", None)
+        m.setdefault("cards", {})
+        for template_id in MODULES[module_id].templates:
+            m["cards"].setdefault(template_id, new_card())
+    return state
+
+
+def save_state(state):
+    os.makedirs(HOME, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=HOME, prefix=".state.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f, indent=1, sort_keys=True)
+    os.replace(tmp, STATE_PATH)
+
+
+def new_card():
+    return {"box": 0, "due": 0, "graduated": False, "perfect_run": 0, "seen": 0, "history": []}
+
+
+def grade_card(card, grade, now=None):
+    """Applies one answer to a template's card. grade is perfect, ok or miss.
+
+    perfect  up a box; graduates from the last box
+    ok       right answer the long way round: stays put, back soon
+    miss     back to the first box, again in ten minutes
+    """
+    now = now or time.time()
+    card["seen"] += 1
+    card["history"] = (card["history"] + [[int(now), grade]])[-HISTORY_KEEP:]
+    if grade == "perfect":
+        card["perfect_run"] += 1
+        if card["box"] >= LAST_BOX:
+            card["graduated"] = True
+            card["due"] = 0
+        else:
+            card["box"] += 1
+            card["due"] = now + BOX_DAYS[card["box"]] * DAY
+    elif grade == "ok":
+        card["perfect_run"] = 0
+        card["due"] = now + max(BOX_DAYS[card["box"]] * DAY / 2, 3600)
+    else:
+        card["perfect_run"] = 0
+        card["box"] = 0
+        card["due"] = now + MISS_RETRY
+
+
+def bump_streak(state, now=None):
+    s = state["streak"]
+    day = today(now)
+    last = datetime.date.fromisoformat(s["last_day"]) if s["last_day"] else None
+    if last == day:
+        return
+    s["days"] = s["days"] + 1 if last == day - datetime.timedelta(days=1) else 1
+    s["best"] = max(s["best"], s["days"])
+    s["last_day"] = day.isoformat()
+
+
+def current_streak(state, now=None):
+    """The streak as it stands: one not extended today is still alive until
+    the end of today, and gone after that."""
+    s = state["streak"]
+    if not s["last_day"]:
+        return 0
+    last = datetime.date.fromisoformat(s["last_day"])
+    return s["days"] if (today(now) - last).days <= 1 else 0
+
+
+def due_templates(state, module_id, now=None):
+    now = now or time.time()
+    cards = state["modules"][module_id]["cards"]
+    return [t for t in MODULES[module_id].templates
+            if not cards[t]["graduated"] and cards[t]["due"] <= now]
+
+
+def module_graduated(state, module_id):
+    cards = state["modules"][module_id]["cards"]
+    return all(cards[t]["graduated"] for t in MODULES[module_id].templates)
+
+
+def running_pid():
+    try:
+        with open(LOCK_PATH) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+# ── terminal editing ────────────────────────────────────────────────────────
+#
+# Cards are graded on the text you end up with, and perfection on doing it in
+# no more keystrokes than par. Par for each template is the chord route the
+# card exists to teach — retyping the line gets the text right and blows par.
+# Spacing is normalised before comparing, because the shell ignores it too.
+
+KEY_NAMES = {"\x01": "^A", "\x05": "^E", "\x0b": "^K", "\x15": "^U", "\x19": "^Y", "\r": "⏎"}
+
+COMMANDS = [
+    "git log --oneline --graph --decorate --all",
+    "git rebase --interactive --autosquash origin/master",
+    "git push --force-with-lease origin feature/search-filters",
+    "docker compose up --build --remove-orphans api worker",
+    "docker run --rm -it -v $PWD:/app node:20 yarn test",
+    "kubectl logs -f deploy/api --since=10m --tail=200",
+    "kubectl get pods -n staging -o wide --watch",
+    "rsync -avz --delete ./dist/ deploy@web1:/srv/www/",
+    "psql -h localhost -U postgres -d realscout_dev -c 'select 1'",
+    "bundle exec rspec spec/models/listing_spec.rb --fail-fast",
+    "bundle exec rails db:migrate:redo VERSION=20261102",
+    "yarn jest src/components/SearchBar --watch --coverage",
+    "find . -name '*.log' -mtime +7 -delete",
+    "ffmpeg -i input.mov -vcodec h264 -acodec aac output.mp4",
+    "aws s3 sync s3://backups/2026-11 ./restore --exclude '*.tmp'",
+    "curl -sS -H 'Accept: application/json' https://api.example.com/v1/status",
+    "tar -czvf archive.tar.gz --exclude=node_modules src docs",
+    "ssh -L 5433:db.internal:5432 bastion.example.com -N",
+    "grep -rn --include='*.rb' 'def perform' app/jobs",
+    "terraform plan -var-file=staging.tfvars -out=plan.out",
+]
+PREREQS = [
+    "git fetch", "git stash", "cd ~/workspace", "brew update", "export AWS_PROFILE=dev",
+    "kubectl config use-context staging", "yarn install", "source .env", "ssh-add",
+]
+SHORT = ["ls", "cd ..", "git status", "pwd", "clear", "htop", "git diff", "make"]
+ENVS = [
+    "NODE_ENV=production", "RAILS_ENV=test", "DEBUG=1", "AWS_PROFILE=staging", "PORT=4000",
+    "LOG_LEVEL=debug", "CI=true", "DISABLE_SPRING=1",
+]
+ENV_COMMANDS = [
+    "yarn build", "bundle exec rspec", "node server.js", "rails console", "yarn dev",
+    "bin/setup", "make test", "python manage.py runserver",
+]
+FILES = [
+    "config/database.yml", "nginx.conf", "~/.zshrc", ".env.local", "package.json",
+    "docker-compose.yml", "Gemfile.lock", "app/models/user.rb",
+]
+SUFFIXES = [".bak", ".orig", ".old", "~"]
+DIRS = ["tmp/scratch", "src/components/Map", "~/workspace/notes", "build/out", "spec/fixtures/mls"]
+
+
+def render_route(route):
+    """^K ^A ^Y ␠ — chords by name, typed runs as text."""
+    out, typed = [], ""
+    for ch in route:
+        if ch in KEY_NAMES:
+            flush(out, typed)
+            typed = ""
+            out.append(KEY_NAMES[ch])
+        else:
+            typed += ch
+    flush(out, typed)
+    return " ".join(out)
+
+
+def flush(out, typed):
+    if typed:
+        out.append("␠" if typed == " " else "'%s'" % typed)
+
+
+def keystrokes(n):
+    return "%d keystroke%s" % (n, "" if n == 1 else "s")
+
+
+def norm(text):
+    return " ".join(text.split())
+
+
+def keys_kill_to_end(rng):
+    tokens = rng.choice(COMMANDS).split()
+    cut = rng.randint(2, len(tokens) - 1)
+    head = " ".join(tokens[:cut])
+    return {
+        "brief": "Everything after the cursor is wrong. Delete it in one go.",
+        "phases": [{"text": " ".join(tokens), "cursor": len(head) + 1, "goal": head, "par": 1, "route": "\x0b"}],
+        "solution": "^K kills from the cursor to the end of the line.",
+    }
+
+
+def keys_clear_line(rng):
+    line = rng.choice(COMMANDS)
+    new = rng.choice(SHORT)
+    return {
+        "brief": "Scrap the whole line — the cursor is mid-line — and run something else.",
+        "phases": [{"text": line, "cursor": rng.randint(4, len(line) - 4), "goal": new, "par": 1 + len(new),
+                    "route": "\x15" + new}],
+        "solution": "^U kills the whole line wherever the cursor is (zsh's kill-whole-line), then type.",
+    }
+
+
+def keys_stash(rng):
+    line = rng.choice(COMMANDS)
+    first = rng.choice(PREREQS)
+    return {
+        "brief": "You're halfway through a long command and realise something has to run first.\n"
+                 "Stash the line, run the other command, then get the long one back without retyping it.",
+        "phases": [
+            {"text": line, "cursor": len(line), "goal": first, "par": 1 + len(first), "label": "run first",
+             "route": "\x15" + first},
+            {"text": "", "cursor": 0, "goal": line, "par": 1, "label": "then restore", "route": "\x19"},
+        ],
+        "solution": "^U stashes the line in the kill ring, type the other command and ⏎, then ^Y yanks the line back.",
+    }
+
+
+def keys_tail_to_front(rng):
+    cmd = rng.choice(ENV_COMMANDS)
+    env = rng.choice(ENVS)
+    return {
+        "brief": "The environment variable belongs in front of the command. Move it there.",
+        "phases": [{"text": cmd + " " + env, "cursor": len(cmd) + 1, "goal": env + " " + cmd, "par": 4,
+                    "route": "\x0b\x01\x19 "}],
+        "solution": "^K kills it, ^A jumps to the start, ^Y puts it back, then a space.",
+    }
+
+
+def keys_duplicate(rng):
+    if rng.random() < 0.5:
+        verb = rng.choice(["cp", "mv"])
+        target = rng.choice(FILES)
+        suffix = rng.choice(SUFFIXES)
+        prefix = verb + " "
+        goal = "%s%s %s%s" % (prefix, target, target, suffix)
+        route = "\x0b\x19 \x19" + suffix
+        solution = "^K kills the path, ^Y puts it back, a space, ^Y again — a yank doesn't use the kill up — then the suffix."
+        brief = "Make the second argument the same path with %s on the end, without retyping the path." % suffix
+    else:
+        target = rng.choice(DIRS)
+        prefix = "mkdir -p "
+        goal = "mkdir -p %s && cd %s" % (target, target)
+        route = "\x0b\x19 && cd \x19"
+        solution = "^K kills the path, ^Y puts it back, type ' && cd ', ^Y again — a yank doesn't use the kill up."
+        brief = "Make the directory and cd into it in one line, without retyping the path."
+    return {
+        "brief": brief,
+        "phases": [{"text": prefix + target, "cursor": len(prefix), "goal": goal, "par": len(route), "route": route}],
+        "solution": solution,
+    }
+
+
+class Module:
+    def __init__(self, title, templates, session_size, run_card):
+        self.title = title
+        self.templates = templates
+        self.session_size = session_size
+        self.run_card = run_card
+
+
+def run_keys_card(template, rng):
+    card = template[1](rng)
+    print(card["brief"])
+    print()
+    for i, p in enumerate(card["phases"]):
+        label = p.get("label", "goal")
+        print("  %s %s" % (FAINT(label.ljust(13)), CYAN(p["goal"])))
+    print("  %s %s" % (FAINT("par".ljust(13)), " then ".join(keystrokes(p["par"]) for p in card["phases"])))
+    print()
+
+    out = tempfile.NamedTemporaryFile(prefix="srs-vared.", delete=False)
+    out.close()
+    args = [os.path.join(HERE, "srs-vared"), out.name]
+    for i, p in enumerate(card["phases"]):
+        hint = "%%F{8}%s%%f" % p.get("label", "") if len(card["phases"]) > 1 else ""
+        args += [str(p["cursor"]), p["text"], hint]
+    drain_input()
+    subprocess.call(args)
+    with open(out.name) as f:
+        lines = f.read().split("\n")
+    os.unlink(out.name)
+
+    if "aborted" in lines or len(lines) < 3 * len(card["phases"]):
+        print(FAINT("\n  skipped"))
+        return None
+
+    grades = []
+    print()
+    for i, p in enumerate(card["phases"]):
+        text, keys = lines[i * 3], int(lines[i * 3 + 1] or 0)
+        right = norm(text) == norm(p["goal"])
+        if right and keys <= p["par"]:
+            grades.append("perfect")
+            print("  %s %s, par %d" % (GREEN("✓ perfect"), keystrokes(keys), p["par"]))
+        elif right:
+            grades.append("ok")
+            print("  %s %s, par %d" % (YELLOW("✓ right, the long way:"), keystrokes(keys), p["par"]))
+        else:
+            grades.append("miss")
+            print("  %s got      %s" % (RED("✗"), text))
+            print("    wanted   %s" % p["goal"])
+    print("\n  " + FAINT("par: ") + "   ⏎   ".join(PINK(render_route(p["route"])) for p in card["phases"]))
+    print("  " + FAINT("how: ") + card["solution"])
+    for g in ("miss", "ok"):
+        if g in grades:
+            return g
+    return "perfect"
+
+
+KEYS = Module(
+    "Terminal editing",
+    {
+        "kill-to-end": ("Kill to end of line", keys_kill_to_end),
+        "clear-line": ("Scrap the line", keys_clear_line),
+        "stash": ("Stash and restore", keys_stash),
+        "tail-to-front": ("Move the tail to the front", keys_tail_to_front),
+        "duplicate": ("Yank twice", keys_duplicate),
+    },
+    session_size=3,
+    run_card=run_keys_card,
+)
+
+
+# ── lateral joins ───────────────────────────────────────────────────────────
+#
+# A scenario is a small database and the exact output to produce from it. Each
+# one is generated with confounding rows — a parent with nothing to join, an
+# event before any rate existed, a range that runs backwards — and before it
+# is shown, the usual wrong answers are run against it too. If any of them
+# happens to produce the right output for this particular data, the scenario
+# is thrown away and regenerated, so the only way to the expected output is
+# the query the card is about.
+
+DUCKDB_CANDIDATES = ["/opt/homebrew/bin/duckdb", "/usr/local/bin/duckdb"]
+
+
+def duckdb_path():
+    for p in DUCKDB_CANDIDATES:
+        if os.access(p, os.X_OK):
+            return p
+    return shutil.which("duckdb")
+
+
+def duck(db, sql, fmt="-json", timeout=10):
+    """Runs one query read-only and returns (rows, error). DuckDB's agent mode
+    switches on when it sees an AI agent's variables and stdout isn't a tty,
+    so the environment is replaced rather than inherited."""
+    env = {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "HOME": os.path.expanduser("~")}
+    try:
+        p = subprocess.run([duckdb_path(), "-readonly", fmt, db, "-c", sql],
+                           capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return None, "timed out after %ds" % timeout
+    if p.returncode != 0:
+        return None, (p.stderr or p.stdout).strip()
+    if fmt != "-json":
+        return p.stdout, None
+    results = []
+    text = p.stdout.strip()
+    decoder = json.JSONDecoder()
+    while text:
+        value, end = decoder.raw_decode(text)
+        results.append(value)
+        text = text[end:].strip()
+    if len(results) > 1:
+        return None, "one statement please — that ran %d" % len(results)
+    return [list(r.values()) for r in (results[0] if results else [])], None
+
+
+def sql_literal(v):
+    if v is None:
+        return "NULL"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, datetime.date):
+        return "DATE '%s'" % v.isoformat()
+    return "'%s'" % str(v).replace("'", "''")
+
+
+def build_db(path, tables):
+    """tables: list of (name, [(column, type)], rows). Rows go in shuffled, so
+    nothing about the answer can be read off the order they are listed in."""
+    stmts = []
+    for name, columns, rows in tables:
+        stmts.append("CREATE TABLE %s (%s);" % (name, ", ".join("%s %s" % c for c in columns)))
+        if rows:
+            stmts.append("INSERT INTO %s VALUES %s;" % (
+                name, ", ".join("(%s)" % ", ".join(sql_literal(v) for v in r) for r in rows)))
+    if os.path.exists(path):
+        os.unlink(path)
+    env = {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "HOME": os.path.expanduser("~")}
+    subprocess.run([duckdb_path(), path, "-c", "\n".join(stmts)], check=True, env=env,
+                   capture_output=True)
+
+
+def other_join(sql, keep_empty, alias):
+    """The same query with the join that keeps or drops empty parents
+    swapped — the mistake every keep-or-drop sentence in a prompt is there to
+    catch."""
+    if keep_empty:
+        return sql.replace("LEFT JOIN LATERAL", "CROSS JOIN LATERAL").replace(" ON true", "")
+    return sql.replace("CROSS JOIN LATERAL", "LEFT JOIN LATERAL").replace(
+        ") %s ORDER" % alias, ") %s ON true ORDER" % alias)
+
+
+def plural(noun, n=2):
+    if n == 1:
+        return noun
+    return noun + ("es" if noun.endswith(("ch", "sh", "s", "x")) else "s")
+
+
+def pick_names(rng, pool, k):
+    return rng.sample(pool, k)
+
+
+def distinct_dates(rng, k, start, span):
+    days = rng.sample(range(span), k)
+    return [start + datetime.timedelta(days=d) for d in days]
+
+
+START = datetime.date(2026, 1, 1)
+
+TOPN_SKINS = [
+    {"parent": "customers", "child": "orders", "fk": "customer_id", "date": "placed_on", "num": "total",
+     "noun": "order", "big": "largest", "names": ["Ada", "Basil", "Cleo", "Dmitri", "Esme", "Farouk", "Greta", "Hiro"]},
+    {"parent": "authors", "child": "posts", "fk": "author_id", "date": "published_on", "num": "views",
+     "noun": "post", "big": "most-viewed", "names": ["ana", "bo", "cy", "dee", "eli", "fen", "gus", "hal"]},
+    {"parent": "repos", "child": "builds", "fk": "repo_id", "date": "started_on", "num": "duration_s",
+     "noun": "build", "big": "longest", "names": ["api", "web", "mobile", "infra", "etl", "search", "billing"]},
+    {"parent": "players", "child": "matches", "fk": "player_id", "date": "played_on", "num": "score",
+     "noun": "match", "big": "highest-scoring", "names": ["kestrel", "lynx", "marten", "newt", "otter", "pika"]},
+]
+
+
+def lateral_topn(rng):
+    s = rng.choice(TOPN_SKINS)
+    n = rng.choice([2, 3])
+    rank = rng.choice([("date", "DESC", "most recent"), ("date", "ASC", "earliest"), ("num", "DESC", s["big"])])
+    rank_col = s[rank[0]]
+    keep_empty = rng.random() < 0.5
+    k = rng.randint(4, 5)
+    names = pick_names(rng, s["names"], k)
+    # One parent with nothing, one with fewer than n, the rest with more.
+    counts = [0, 1] + [rng.randint(n + 1, n + 3) for _ in range(k - 2)]
+    rng.shuffle(counts)
+    parents, children = [], []
+    ids = rng.sample(range(100, 999), sum(counts))
+    for pid, (name, count) in enumerate(zip(names, counts), start=1):
+        parents.append((pid, name))
+        for d, v in zip(distinct_dates(rng, count, START, 300), rng.sample(range(10, 500), count)):
+            children.append((ids.pop(), pid, d, v))
+    rng.shuffle(parents)
+    rng.shuffle(children)
+
+    join = "LEFT JOIN LATERAL" if keep_empty else "CROSS JOIN LATERAL"
+    on = " ON true" if keep_empty else ""
+    sel = "SELECT p.name, c.{d}, c.{n} FROM {P} p {join} (SELECT {d}, {n} FROM {C} WHERE {C}.{fk} = p.id ORDER BY {{rank}} LIMIT {N}) c{on} ORDER BY p.name, c.{{rank}}"
+    sel = sel.format(d=s["date"], n=s["num"], P=s["parent"], C=s["child"], fk=s["fk"], N=n, join=join, on=on)
+    solution = sel.format(rank="%s %s" % (rank_col, rank[1]))
+    other_col = s["num"] if rank[0] == "date" else s["date"]
+    flip = "ASC" if rank[1] == "DESC" else "DESC"
+    wrong = [
+        sel.format(rank="%s %s" % (other_col, rank[1])),
+        sel.format(rank="%s %s" % (rank_col, flip)),
+        other_join(solution, keep_empty, "c"),
+        "SELECT p.name, c.{d}, c.{n} FROM {P} p JOIN {C} c ON c.{fk} = p.id ORDER BY c.{r} {dir} LIMIT {N}".format(
+            d=s["date"], n=s["num"], P=s["parent"], C=s["child"], fk=s["fk"], r=rank_col, dir=rank[1], N=n),
+    ]
+    empty = ("Every %s appears — one with no %s still gets a row, with NULLs." % (s["parent"][:-1], plural(s["noun"]))
+             if keep_empty else "Only %s that have %s appear." % (s["parent"], plural(s["noun"])))
+    return {
+        "title": "Top %d per group" % n,
+        "prompt": "For each of the %s, its %d %s %s (by %s): name, %s, %s.\n%s\n"
+                  "Sorted by name, then %s %s." % (
+                      s["parent"], n, rank[2], plural(s["noun"]), rank_col, s["date"], s["num"], empty, rank_col, rank[1]),
+        "tables": [
+            (s["parent"], [("id", "INTEGER"), ("name", "VARCHAR")], parents),
+            (s["child"], [("id", "INTEGER"), (s["fk"], "INTEGER"), (s["date"], "DATE"), (s["num"], "INTEGER")], children),
+        ],
+        "solution": solution,
+        "wrong": wrong,
+        "why": "The subquery runs once per %s row and can see p.id, so its ORDER BY … LIMIT %d is per %s — "
+               "a plain join can only limit the whole result.%s" % (
+                   s["parent"][:-1], n, s["parent"][:-1],
+                   " LEFT JOIN LATERAL … ON true keeps the parent whose subquery came back empty." if keep_empty else
+                   " CROSS JOIN LATERAL drops the parent whose subquery came back empty."),
+    }
+
+
+LATEST_SKINS = [
+    {"parent": "repos", "child": "builds", "fk": "repo_id", "ts": "finished_at", "val": "status",
+     "noun": "build", "values": ["passed", "failed", "canceled", "errored"],
+     "names": ["api", "web", "mobile", "infra", "etl", "search"]},
+    {"parent": "devices", "child": "heartbeats", "fk": "device_id", "ts": "seen_at", "val": "state",
+     "noun": "heartbeat", "values": ["online", "degraded", "offline", "booting"],
+     "names": ["kiosk-1", "kiosk-2", "lobby-tv", "printer", "router", "nas"]},
+    {"parent": "tickets", "child": "transitions", "fk": "ticket_id", "ts": "changed_at", "val": "status",
+     "noun": "transition", "values": ["open", "triaged", "blocked", "done", "wontfix"],
+     "names": ["SR-101", "SR-117", "SR-140", "SR-152", "SR-199", "SR-203"]},
+]
+
+
+def lateral_latest(rng):
+    s = rng.choice(LATEST_SKINS)
+    latest = rng.random() < 0.7
+    keep_empty = rng.random() < 0.5
+    k = rng.randint(4, 5)
+    names = pick_names(rng, s["names"], k)
+    counts = [0] + [rng.randint(2, 5) for _ in range(k - 1)]
+    rng.shuffle(counts)
+    parents, children = [], []
+    ids = rng.sample(range(1, 200), sum(counts))
+    base = datetime.datetime(2026, 11, 1, 8, 0)
+    for pid, (name, count) in enumerate(zip(names, counts), start=1):
+        parents.append((pid, name))
+        minutes = rng.sample(range(0, 60 * 24 * 10, 7), count)
+        for m in minutes:
+            ts = base + datetime.timedelta(minutes=m)
+            children.append((ids.pop(), pid, ts.strftime("%Y-%m-%d %H:%M"), rng.choice(s["values"])))
+    rng.shuffle(parents)
+    rng.shuffle(children)
+
+    d = "DESC" if latest else "ASC"
+    join = "LEFT JOIN LATERAL" if keep_empty else "CROSS JOIN LATERAL"
+    on = " ON true" if keep_empty else ""
+    tmpl = ("SELECT p.name, x.{ts}, x.{val} FROM {P} p {join} (SELECT {ts}, {val} FROM {C} "
+            "WHERE {C}.{fk} = p.id ORDER BY {{order}} LIMIT 1) x{on} ORDER BY p.name")
+    tmpl = tmpl.format(ts=s["ts"], val=s["val"], P=s["parent"], C=s["child"], fk=s["fk"], join=join, on=on)
+    solution = tmpl.format(order="%s %s" % (s["ts"], d))
+    agg = "max" if latest else "min"
+    wrong = [
+        tmpl.format(order="id DESC"),
+        tmpl.format(order="%s %s" % (s["ts"], "ASC" if latest else "DESC")),
+        "SELECT p.name, {a}(c.{ts}), {a}(c.{val}) FROM {P} p {j} {C} c ON c.{fk} = p.id GROUP BY p.name ORDER BY p.name".format(
+            a=agg, ts=s["ts"], val=s["val"], P=s["parent"], C=s["child"], fk=s["fk"],
+            j="LEFT JOIN" if keep_empty else "JOIN"),
+        other_join(solution, keep_empty, "x"),
+    ]
+    which = "latest" if latest else "first"
+    return {
+        "title": "The %s row, whole" % which,
+        "prompt": "Each %s's %s %s — when, and its %s: name, %s, %s.\n%s\nSorted by name." % (
+            s["parent"][:-1], which, s["noun"], s["val"], s["ts"], s["val"],
+            "Every %s appears, with NULLs if it has none." % s["parent"][:-1] if keep_empty
+            else "Only %s that have one." % s["parent"]),
+        "tables": [
+            (s["parent"], [("id", "INTEGER"), ("name", "VARCHAR")], parents),
+            (s["child"], [("id", "INTEGER"), (s["fk"], "INTEGER"), (s["ts"], "TIMESTAMP"), (s["val"], "VARCHAR")], children),
+        ],
+        "solution": solution,
+        "wrong": wrong,
+        "why": "GROUP BY with %s() finds the %s time, but %s(%s) is computed separately and comes from whatever row "
+               "sorts %s — not the same row. ORDER BY … LIMIT 1 inside the lateral picks one row and keeps all of it." % (
+                   agg, which, agg, s["val"], "last" if latest else "first"),
+    }
+
+
+ASOF_SKINS = [
+    {"rates": "prices", "key": "product", "eff": "effective_on", "rate": "price",
+     "events": "sales", "on": "sold_on", "measure": "qty", "derived": "revenue",
+     "keys": ["lamp", "desk", "chair", "shelf", "rug"], "noun": "sale", "rate_range": (20, 400), "m_range": (1, 9)},
+    {"rates": "fx_rates", "key": "currency", "eff": "effective_on", "rate": "usd_per_unit_x100",
+     "events": "payments", "on": "paid_on", "measure": "amount", "derived": "usd_x100",
+     "keys": ["EUR", "GBP", "JPY", "CAD", "MXN"], "noun": "payment", "rate_range": (5, 140), "m_range": (10, 900)},
+    {"rates": "salaries", "key": "employee", "eff": "effective_on", "rate": "salary",
+     "events": "reviews", "on": "held_on", "measure": "rating", "derived": None,
+     "keys": ["Ines", "Jonas", "Keiko", "Luis", "Mona"], "noun": "review", "rate_range": (80, 240), "m_range": (1, 5)},
+]
+
+
+def lateral_asof(rng):
+    s = rng.choice(ASOF_SKINS)
+    keys = pick_names(rng, s["keys"], rng.randint(2, 3))
+    rates, events = [], []
+    for key in keys:
+        for d, v in zip(sorted(distinct_dates(rng, rng.randint(2, 4), START, 200)),
+                        rng.sample(range(*s["rate_range"]), 4)):
+            rates.append((key, d, v))
+    key_rates = {k: sorted([(d, v) for kk, d, v in rates if kk == k]) for k in keys}
+    ids = rng.sample(range(1, 99), 9)
+    # One event before its key's first rate, one landing exactly on a change,
+    # the rest anywhere — including after the last change.
+    early_key, exact_key = rng.choice(keys), rng.choice(keys)
+    events.append((ids.pop(), early_key, key_rates[early_key][0][0] - datetime.timedelta(days=rng.randint(1, 20)),
+                   rng.randint(*s["m_range"])))
+    events.append((ids.pop(), exact_key, rng.choice(key_rates[exact_key][1:])[0], rng.randint(*s["m_range"])))
+    for _ in range(rng.randint(4, 6)):
+        events.append((ids.pop(), rng.choice(keys), START + datetime.timedelta(days=rng.randint(0, 240)),
+                       rng.randint(*s["m_range"])))
+    rng.shuffle(rates)
+    rng.shuffle(events)
+
+    derived = (", e.{m} * r.{rate} AS {der}".format(m=s["measure"], rate=s["rate"], der=s["derived"])
+               if s["derived"] else "")
+    tmpl = ("SELECT e.id, e.{key}, e.{on}, r.{rate}{derived} FROM {E} e {{join}} (SELECT {rate} FROM {R} "
+            "WHERE {R}.{key} = e.{key}{{when}} ORDER BY {R}.{eff} {{dir}} LIMIT 1) r{{on}} "
+            "ORDER BY e.{on}, e.id").format(key=s["key"], on=s["on"], rate=s["rate"], derived=derived,
+                                             E=s["events"], R=s["rates"], eff=s["eff"])
+    on_or_before = " AND {R}.{eff} <= e.{on}".format(R=s["rates"], eff=s["eff"], on=s["on"])
+    solution = tmpl.format(join="LEFT JOIN LATERAL", when=on_or_before, dir="DESC", on=" ON true")
+    wrong = [
+        tmpl.format(join="CROSS JOIN LATERAL", when=on_or_before, dir="DESC", on=""),
+        tmpl.format(join="LEFT JOIN LATERAL", when=on_or_before.replace("<=", "<"), dir="DESC", on=" ON true"),
+        tmpl.format(join="LEFT JOIN LATERAL", when=on_or_before, dir="ASC", on=" ON true"),
+        tmpl.format(join="LEFT JOIN LATERAL", when="", dir="DESC", on=" ON true"),
+    ]
+    cols = "id, %s, %s, %s" % (s["key"], s["on"], s["rate"]) + (", %s (= %s × %s)" % (s["derived"], s["measure"], s["rate"]) if s["derived"] else "")
+    return {
+        "title": "As of then",
+        "prompt": "Every %s with the %s that was in effect on its date — the latest change on or before it: %s.\n"
+                  "A %s from before any %s existed keeps its row, with NULLs.\nSorted by %s, then id." % (
+                      s["noun"], s["rate"], cols, s["noun"], s["rate"], s["on"]),
+        "tables": [
+            (s["rates"], [(s["key"], "VARCHAR"), (s["eff"], "DATE"), (s["rate"], "INTEGER")], rates),
+            (s["events"], [("id", "INTEGER"), (s["key"], "VARCHAR"), (s["on"], "DATE"), (s["measure"], "INTEGER")], events),
+        ],
+        "solution": solution,
+        "wrong": wrong,
+        "why": "The lateral subquery filters on the outer row's own date, which no plain join condition can rank by. "
+               "<= catches the change that lands on the day itself; LEFT JOIN … ON true keeps the %s that predates every %s." % (
+                   s["noun"], s["rate"]),
+    }
+
+
+RANGE_SKINS = [
+    {"table": "on_call", "who": "engineer", "lo": "first_week", "hi": "last_week", "unit": "week",
+     "names": ["Ari", "Bea", "Cal", "Dov", "Eun", "Fia"], "span": (1, 12)},
+    {"table": "rentals", "who": "item", "lo": "first_day", "hi": "last_day", "unit": "day",
+     "names": ["kayak", "tent", "bike", "drone", "stove", "sled"], "span": (1, 14)},
+    {"table": "bookings", "who": "guest", "lo": "from_seat", "hi": "to_seat", "unit": "seat",
+     "names": ["Ng", "Okafor", "Patel", "Quinn", "Rossi", "Sato"], "span": (1, 20)},
+]
+
+
+def lateral_ranges(rng):
+    s = rng.choice(RANGE_SKINS)
+    count_mode = rng.random() < 0.4
+    names = pick_names(rng, s["names"], rng.randint(4, 5))
+    lo_min, hi_max = s["span"]
+    rows = []
+    for i, name in enumerate(names):
+        a = rng.randint(lo_min + 2, hi_max - 3)
+        if i == 0:
+            b = a  # a one-unit range
+        elif i == 1:
+            b = a - rng.randint(1, 2)  # entered backwards: covers nothing
+        else:
+            b = a + rng.randint(1, 4)
+        rows.append((name, a, min(b, hi_max)))
+    rng.shuffle(rows)
+
+    gen = "generate_series(t.{lo}, t.{hi})".format(**s)
+    if count_mode:
+        tmpl = ("SELECT g.{unit}, count(*) AS n FROM {table} t CROSS JOIN LATERAL {{gen}} AS g({unit}) "
+                "GROUP BY g.{unit} ORDER BY g.{unit}").format(**s)
+        what = ("How many %ss cover each %s, counting %s through %s inclusive: %s, n — only %ss with at least "
+                "one. Sorted by %s." % (s["who"], s["unit"], s["lo"], s["hi"], s["unit"], s["unit"], s["unit"]))
+    else:
+        tmpl = ("SELECT g.{unit}, t.{who} FROM {table} t CROSS JOIN LATERAL {{gen}} AS g({unit}) "
+                "ORDER BY g.{unit}, t.{who}").format(**s)
+        what = "One row per %s each %s covers, %s through %s inclusive: %s, %s. Sorted by %s, then %s." % (
+            s["unit"], s["who"], s["lo"], s["hi"], s["unit"], s["who"], s["unit"], s["who"])
+    solution = tmpl.format(gen=gen)
+    wrong = [
+        tmpl.format(gen="range(t.{lo}, t.{hi})".format(**s)),
+        tmpl.format(gen="generate_series(least(t.{lo}, t.{hi}), greatest(t.{lo}, t.{hi}))".format(**s)),
+        tmpl.format(gen="generate_series(t.{lo}, t.{hi} + 1)".format(**s)),
+    ]
+    return {
+        "title": "One row per %s" % s["unit"],
+        "prompt": what + "\nA range entered backwards covers nothing.",
+        "tables": [(s["table"], [(s["who"], "VARCHAR"), (s["lo"], "INTEGER"), (s["hi"], "INTEGER")], rows)],
+        "solution": solution,
+        "wrong": wrong,
+        "why": "A set-returning function in a LATERAL position runs once per row with that row's bounds. "
+               "generate_series includes both ends (range() stops short), and a backwards range yields nothing.",
+    }
+
+
+PRIOR_SKINS = [
+    {"table": "orders", "who": "customer", "on": "placed_on", "names": ["Ada", "Basil", "Cleo", "Dmitri"], "noun": "order"},
+    {"table": "commits", "who": "author", "on": "committed_on", "names": ["ana", "bo", "cy", "dee"], "noun": "commit"},
+    {"table": "visits", "who": "patient", "on": "visited_on", "names": ["P-04", "P-11", "P-27", "P-38"], "noun": "visit"},
+]
+
+
+def lateral_prior(rng):
+    s = rng.choice(PRIOR_SKINS)
+    names = pick_names(rng, s["names"], 3)
+    rows = []
+    ids = rng.sample(range(1, 99), 12)
+    for name in names:
+        for d in distinct_dates(rng, rng.randint(2, 4), START, 90):
+            rows.append((ids.pop(), name, d))
+    rng.shuffle(rows)
+
+    tmpl = ("SELECT o.id, o.{who}, o.{on}, p.prior, p.previous FROM {table} o CROSS JOIN LATERAL "
+            "(SELECT count(*) AS prior, max(q.{on}) AS previous FROM {table} q WHERE {{where}}) p "
+            "ORDER BY o.{on}, o.id").format(**s)
+    solution = tmpl.format(where="q.{who} = o.{who} AND q.{on} < o.{on}".format(**s))
+    wrong = [
+        tmpl.format(where="q.{who} = o.{who} AND q.{on} <= o.{on}".format(**s)),
+        tmpl.format(where="q.{on} < o.{on}".format(**s)),
+        tmpl.format(where="q.{who} = o.{who} AND q.id < o.id".format(**s)),
+    ]
+    return {
+        "title": "Looking back from each row",
+        "prompt": "Every %s, with how many earlier %ss the same %s had and the date of the one just before: "
+                  "id, %s, %s, prior, previous.\nA first %s has prior 0 and previous NULL. Sorted by %s, then id." % (
+                      s["noun"], s["noun"], s["who"], s["who"], s["on"], s["noun"], s["on"]),
+        "tables": [(s["table"], [("id", "INTEGER"), (s["who"], "VARCHAR"), (s["on"], "DATE")], rows)],
+        "solution": solution,
+        "wrong": wrong,
+        "why": "An aggregate subquery always returns exactly one row, so CROSS JOIN LATERAL keeps every outer row even "
+               "when nothing came before — count() gives 0 and max() gives NULL. Ids are not in date order, so "
+               "'earlier' has to come from the date.",
+    }
+
+
+DERIVED_SKINS = [
+    {"table": "line_items", "label": "sku", "a": "qty", "b": "unit_price", "c": "discount", "x": "gross", "y": "net",
+     "op": "-", "labels": ["A-100", "A-220", "B-310", "C-405", "C-512", "D-618", "E-707", "F-811"]},
+    {"table": "timesheets", "label": "contractor", "a": "hours", "b": "rate", "c": "expenses", "x": "fees", "y": "billed",
+     "op": "+", "labels": ["Ivy", "Jun", "Kai", "Lea", "Max", "Noa", "Oz", "Pia"]},
+    {"table": "shipments", "label": "tracking", "a": "kg", "b": "per_kg", "c": "rebate", "x": "base", "y": "charged",
+     "op": "-", "labels": ["1Z90", "1Z91", "1Z92", "1Z93", "1Z94", "1Z95", "1Z96", "1Z97"]},
+]
+
+
+def lateral_derived(rng):
+    s = rng.choice(DERIVED_SKINS)
+    labels = pick_names(rng, s["labels"], rng.randint(6, 8))
+    rows = []
+    for i, label in enumerate(labels):
+        a, b = rng.randint(1, 12), rng.randint(5, 60)
+        c = rng.randint(0, a * b // 2)
+        rows.append([i + 1, label, a, b, c])
+    nets = sorted(r[2] * r[3] + (r[4] if s["op"] == "+" else -r[4]) for r in rows)
+    threshold = nets[len(nets) // 2]  # one row sits exactly on it
+    at_least = rng.random() < 0.4
+    asc = rng.random() < 0.4
+    rng.shuffle(rows)
+    rows = [tuple(r) for r in rows]
+
+    tmpl = ("SELECT t.{label}, g.{x}, n.{y} FROM {table} t "
+            "CROSS JOIN LATERAL (SELECT t.{a} * t.{b} AS {x}) g "
+            "CROSS JOIN LATERAL (SELECT g.{x} {op} t.{c} AS {y}) n "
+            "WHERE {{filt}} {{cmp}} {th} ORDER BY n.{y} {{dir}}, t.{label}").format(th=threshold, **s)
+    cmp = ">=" if at_least else ">"
+    d = "ASC" if asc else "DESC"
+    solution = tmpl.format(filt="n.%s" % s["y"], cmp=cmp, dir=d)
+    wrong = [
+        tmpl.format(filt="g.%s" % s["x"], cmp=cmp, dir=d),
+        tmpl.format(filt="n.%s" % s["y"], cmp=">" if at_least else ">=", dir=d),
+        tmpl.format(filt="n.%s" % s["y"], cmp=cmp, dir="DESC" if asc else "ASC"),
+    ]
+    sign = "minus" if s["op"] == "-" else "plus"
+    return {
+        "title": "Name it once, use it twice",
+        "prompt": "%s = %s × %s, and %s = %s %s %s. Show %s, %s, %s for rows whose %s is %s %d,\n"
+                  "sorted by %s %s, then %s. Compute each value once with LATERAL rather than repeating the arithmetic." % (
+                      s["x"], s["a"], s["b"], s["y"], s["x"], sign, s["c"], s["label"], s["x"], s["y"], s["y"],
+                      "at least" if at_least else "more than", threshold, s["y"],
+                      "ascending" if asc else "descending", s["label"]),
+        "tables": [(s["table"], [("id", "INTEGER"), (s["label"], "VARCHAR"), (s["a"], "INTEGER"),
+                                 (s["b"], "INTEGER"), (s["c"], "INTEGER")], rows)],
+        "solution": solution,
+        "wrong": wrong,
+        "why": "Each LATERAL can see the columns before it, so %s is defined once and %s builds on it — and both are "
+               "real columns by the time WHERE and ORDER BY run." % (s["x"], s["y"]),
+    }
+
+
+def make_scenario(gen, rng, workdir, tries=30):
+    """Generates a scenario whose wrong answers all miss. Returns it with the
+    path of its database and the expected rows."""
+    db = os.path.join(workdir, "scenario.duckdb")
+    for _ in range(tries):
+        sc = gen(rng)
+        build_db(db, sc["tables"])
+        expected, err = duck(db, sc["solution"])
+        if err:
+            raise RuntimeError("reference query failed: %s\n%s" % (err, sc["solution"]))
+        if not expected:
+            continue
+        if all(duck(db, w)[0] != expected for w in sc["wrong"]):
+            sc["db"], sc["expected"] = db, expected
+            return sc
+    raise RuntimeError("could not generate a scenario that rules out every wrong answer")
+
+
+def strip_sql_comments(sql):
+    return "\n".join(line.split("--", 1)[0] for line in sql.splitlines())
+
+
+def editor_command(path):
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vim"
+    parts = editor.split()
+    if os.path.basename(parts[0]) in ("vim", "nvim", "vi"):
+        parts.append("+")
+    return parts + [path]
+
+
+def diagnose(got, expected):
+    if len(got) and len(expected) and len(got[0]) != len(expected[0]):
+        return "%d column%s, expected %d" % (len(got[0]), "" if len(got[0]) == 1 else "s", len(expected[0]))
+    if sorted(map(repr, got)) == sorted(map(repr, expected)):
+        return "the right rows in the wrong order"
+    missing = [r for r in expected if r not in got]
+    extra = [r for r in got if r not in expected]
+    notes = []
+    if missing:
+        notes.append("%d expected row%s missing" % (len(missing), "" if len(missing) == 1 else "s"))
+    if extra:
+        notes.append("%d row%s that shouldn't be there" % (len(extra), "" if len(extra) == 1 else "s"))
+    return ", ".join(notes) or "different values"
+
+
+def run_lateral_card(template, rng):
+    if not duckdb_path():
+        print(RED("duckdb is not installed — brew install duckdb"))
+        return None
+    workdir = os.path.join(HOME, "work")
+    os.makedirs(workdir, exist_ok=True)
+    sc = make_scenario(template[1], rng, workdir)
+
+    shown = []
+    for name, _, _ in sc["tables"]:
+        shown.append(name + "\n" + duck(sc["db"], "SELECT * FROM %s" % name, fmt="-box")[0].rstrip())
+    expected_box = duck(sc["db"], sc["solution"], fmt="-box")[0].rstrip()
+
+    def as_comment(text):
+        return "\n".join(("-- " + line).rstrip() for line in text.splitlines())
+
+    header = "\n\n".join([
+        as_comment(sc["title"] + "\n\n" + sc["prompt"] + "\nUse LATERAL. Save and quit to run it."),
+        as_comment("\n\n".join(shown)),
+        as_comment("expected\n" + expected_box),
+    ])
+    path = os.path.join(workdir, "answer.sql")
+    with open(path, "w") as f:
+        f.write(header + "\n\n")
+
+    print(BOLD(sc["title"]))
+    print(sc["prompt"])
+    print()
+    for block in shown:
+        print(FAINT(block))
+        print()
+    print(CYAN("expected"))
+    print(CYAN(expected_box))
+    print()
+
+    attempts = 0
+    used_lateral_late = False
+    while True:
+        drain_input()
+        choice = ask(FAINT("[Return] write the query   [s] show the answer   [q] quit  "), ["write", "show", "quit"])
+        if choice == "quit":
+            return None
+        if choice == "show":
+            print("\n" + GREEN(sc["solution"]))
+            print("\n" + FAINT("why: ") + sc["why"])
+            return "miss"
+        subprocess.call(editor_command(path))
+        with open(path) as f:
+            sql = f.read()
+        body = strip_sql_comments(sql).strip()
+        if not body:
+            continue
+        attempts += 1
+        got, err = duck(sc["db"], body)
+        clear()
+        print(BOLD(sc["title"]) + FAINT("  attempt %d" % attempts))
+        print(CYAN(expected_box))
+        print()
+        if err:
+            print(RED(err))
+            continue
+        if got != sc["expected"]:
+            mine, _ = duck(sc["db"], body, fmt="-box")
+            print((mine or "").rstrip())
+            print(RED("✗ " + diagnose(got, sc["expected"])))
+            continue
+        if not re.search(r"\blateral\b", body, re.I):
+            print(YELLOW("✓ right output — now do it with LATERAL. (DuckDB lets a subquery in FROM see earlier "
+                         "tables without it; Postgres won't.)"))
+            used_lateral_late = True
+            continue
+        print(GREEN("✓ that's it") + FAINT("  (%d attempt%s)" % (attempts, "" if attempts == 1 else "s")))
+        print("\n" + FAINT("why: ") + sc["why"])
+        return "perfect" if attempts == 1 and not used_lateral_late else "ok"
+
+
+LATERAL = Module(
+    "Lateral joins",
+    {
+        "top-n": ("Top N per group", lateral_topn),
+        "latest-row": ("Latest row, whole", lateral_latest),
+        "as-of": ("As-of lookup", lateral_asof),
+        "ranges": ("Expand ranges", lateral_ranges),
+        "prior": ("Looking back", lateral_prior),
+        "derived": ("Name it once", lateral_derived),
+    },
+    session_size=1,
+    run_card=run_lateral_card,
+)
+
+MODULES = {"keys": KEYS, "lateral": LATERAL}
+
+
+# ── commands ────────────────────────────────────────────────────────────────
+
+def cmd_status(args):
+    state = load_state()
+    now = time.time()
+    modules = []
+    for module_id, module in MODULES.items():
+        m = state["modules"][module_id]
+        cards = m["cards"]
+        templates = []
+        for tid, (title, _) in module.templates.items():
+            c = cards[tid]
+            templates.append({"id": tid, "title": title, "box": c["box"], "graduated": c["graduated"],
+                              "due": c["due"], "perfect_run": c["perfect_run"], "seen": c["seen"]})
+        upcoming = [c["due"] for c in cards.values() if not c["graduated"] and c["due"] > now]
+        modules.append({
+            "id": module_id, "title": module.title, "active": m["active"],
+            "graduated": module_graduated(state, module_id),
+            "due": len(due_templates(state, module_id, now)),
+            "total": len(module.templates),
+            "mastered": sum(1 for c in cards.values() if c["graduated"]),
+            "next_due": min(upcoming) if upcoming else None,
+            "templates": templates,
+        })
+    s = state["streak"]
+    out = {
+        "streak": {"days": current_streak(state, now), "best": s["best"],
+                   "today": s["last_day"] == today(now).isoformat()},
+        "snooze_until": state["snooze_until"],
+        "running": running_pid() is not None,
+        "modules": modules,
+        "duckdb": duckdb_path() is not None,
+    }
+    if "--json" in args:
+        print(json.dumps(out))
+        return 0
+    print("streak %d day%s (best %d)%s" % (out["streak"]["days"], "" if out["streak"]["days"] == 1 else "s",
+                                          s["best"], "" if out["streak"]["today"] else " — not yet today"))
+    for m in modules:
+        flag = "graduated" if m["graduated"] else ("paused" if not m["active"] else "%d due" % m["due"])
+        print("\n%s  %s" % (BOLD(m["title"]), FAINT(flag)))
+        for t in m["templates"]:
+            print("  %s  %s" % (meter(t["box"], t["graduated"]), t["title"]))
+    return 0
+
+
+def pickable(state, now):
+    return [mid for mid in MODULES
+            if state["modules"][mid]["active"] and not module_graduated(state, mid)
+            and due_templates(state, mid, now)]
+
+
+def cmd_pick(args):
+    """One module, weighted by how much it has due — a popup quizzes a single
+    module, never every active one at once."""
+    state = load_state()
+    now = time.time()
+    choices = pickable(state, now)
+    if not choices:
+        return 1
+    weights = [len(due_templates(state, mid, now)) for mid in choices]
+    print(random.choices(choices, weights=weights)[0])
+    return 0
+
+
+def cmd_snooze(args):
+    minutes = float(args[0]) if args else 60
+    state = load_state()
+    state["snooze_until"] = time.time() + minutes * 60
+    save_state(state)
+    return 0
+
+
+def cmd_toggle(args):
+    state = load_state()
+    m = state["modules"][args[0]]
+    m["active"] = not m["active"]
+    save_state(state)
+    return 0
+
+
+def cmd_reset(args):
+    state = load_state()
+    state["modules"].pop(args[0], None)
+    save_state(with_defaults(state))
+    return 0
+
+
+def gate(module, count):
+    """The first screen of a popup. It has just taken the keyboard from
+    whatever you were doing, so anything typed in the first moment is
+    discarded before it asks."""
+    clear()
+    print(PINK("◈ ") + BOLD("Quiz time") + FAINT(" · ") + module.title + FAINT(" · %d card%s" % (count, "" if count == 1 else "s")))
+    print()
+    time.sleep(0.8)
+    drain_input()
+    return ask(FAINT("[Return] start   [s] snooze an hour   [q] not now  "), ["start", "snooze", "quit"])
+
+
+def cmd_run(args):
+    """One quiz at a time: the lock is claimed before anything is shown, so a
+    quiz still sitting on its first screen counts as open too."""
+    if not claim_lock():
+        print("a quiz is already open")
+        return 3
+    signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))
+    try:
+        return run_session(args)
+    finally:
+        try:
+            os.unlink(LOCK_PATH)
+        except OSError:
+            pass
+
+
+def claim_lock():
+    os.makedirs(HOME, exist_ok=True)
+    if running_pid():
+        return False
+    try:
+        os.unlink(LOCK_PATH)  # left by a quiz that died without cleaning up
+    except OSError:
+        pass
+    try:
+        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w") as f:
+        f.write(str(os.getpid()))
+    return True
+
+
+def run_session(args):
+    popup = "--popup" in args
+    practice = "--practice" in args
+    names = [a for a in args if not a.startswith("--")]
+    state = load_state()
+    now = time.time()
+
+    if names:
+        module_id = names[0]
+        if module_id not in MODULES:
+            print("unknown module %s — one of %s" % (module_id, ", ".join(MODULES)))
+            return 2
+    else:
+        choices = pickable(state, now) or [m for m in MODULES if state["modules"][m]["active"]]
+        if not choices:
+            print("nothing active")
+            return 1
+        module_id = random.choice(choices)
+    module = MODULES[module_id]
+
+    due = due_templates(state, module_id, now)
+    if not due:
+        practice = True
+    pool = due if (due and not practice) else list(module.templates)
+    random.shuffle(pool)
+    session = pool[:module.session_size]
+
+    if popup:
+        choice = gate(module, len(session))
+        if choice == "snooze":
+            cmd_snooze(["60"])
+            return 0
+        if choice == "quit":
+            return 0
+
+    rng = random.Random()
+    tally = []
+    for i, tid in enumerate(session):
+        state = load_state()
+        card = state["modules"][module_id]["cards"][tid]
+        template = module.templates[tid]
+        clear()
+        mode = FAINT("  practice — progress unchanged") if practice else ""
+        print(PINK("◈ ") + BOLD(module.title) + FAINT(" · %d/%d · %s   " % (i + 1, len(session), template[0]))
+              + meter(card["box"], card["graduated"]) + mode)
+        print()
+        grade = module.run_card(template, rng)
+        if grade is None:
+            break
+        tally.append(grade)
+        state = load_state()
+        if not practice:
+            grade_card(state["modules"][module_id]["cards"][tid], grade)
+            if module_graduated(state, module_id) and not state["modules"][module_id]["graduated_at"]:
+                state["modules"][module_id]["graduated_at"] = int(time.time())
+                print("\n" + GREEN("🎓 %s graduated — every card perfect from the last box." % module.title))
+        bump_streak(state)
+        save_state(state)
+        if i < len(session) - 1:
+            drain_input()
+            if ask(FAINT("\n[Return] next   [q] stop here  "), ["next", "quit"]) == "quit":
+                break
+
+    if tally:
+        state = load_state()
+        print("\n" + FAINT("streak ") + ORANGE("%d day%s" % (current_streak(state), "" if current_streak(state) == 1 else "s"))
+              + FAINT("  ·  ") + " ".join({"perfect": GREEN("●"), "ok": YELLOW("●"), "miss": RED("●")}[g] for g in tally))
+        if popup:
+            drain_input()
+            ask(FAINT("[Return] back to work  "), ["done"])
+    return 0
+
+
+COMMANDS_TABLE = {"status": cmd_status, "pick": cmd_pick, "run": cmd_run, "snooze": cmd_snooze,
+                  "toggle": cmd_toggle, "reset": cmd_reset}
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] not in COMMANDS_TABLE:
+        print(__doc__.strip())
+        return 2
+    try:
+        return COMMANDS_TABLE[argv[1]](argv[2:])
+    except KeyboardInterrupt:
+        print()
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
