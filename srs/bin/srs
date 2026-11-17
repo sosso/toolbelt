@@ -11,6 +11,7 @@ every template in it has.
   srs status [--json]       what is due, streaks, progress
   srs pick                  the one module the next popup should quiz
   srs run [MODULE] [--popup] [--practice]
+  srs learn MODULE [CARD]   the primer and lessons, nothing graded
   srs snooze MINUTES        hold popups
   srs toggle MODULE         pause or resume a module
   srs reset MODULE          forget a module's progress
@@ -35,12 +36,17 @@ HOME = os.environ.get("SRS_HOME") or os.path.expanduser("~/.local/share/srs")
 STATE_PATH = os.path.join(HOME, "state.json")
 LOCK_PATH = os.path.join(HOME, "running.pid")
 
-DAY = 86400
-# Days until the next review after a perfect answer lands a template in box b.
-# A perfect answer in the last box graduates it, so the shortest road to
-# graduation is six perfects across roughly two months.
-BOX_DAYS = [0, 1, 3, 7, 14, 30]
-LAST_BOX = len(BOX_DAYS) - 1
+HOUR = 3600
+DAY = 24 * HOUR
+# How long until the next review after a perfect answer lands a card in box b:
+# a same-day repeat a few hours later, then tomorrow, a few days, a week, two
+# weeks. A perfect answer from the last box graduates it, so the shortest
+# road is six perfects across about four weeks — and any miss starts it over.
+BOX_INTERVALS = [0, 3 * HOUR, 1 * DAY, 3 * DAY, 7 * DAY, 14 * DAY]
+LAST_BOX = len(BOX_INTERVALS) - 1
+# Intervals of a day or more are jittered so cards learned together don't
+# keep coming due together.
+JITTER = 0.1
 MISS_RETRY = 10 * 60
 HISTORY_KEEP = 30
 
@@ -100,7 +106,7 @@ def meter(box, graduated=False):
 # ── state ───────────────────────────────────────────────────────────────────
 
 def today(now=None):
-    return datetime.date.fromtimestamp(now or time.time())
+    return datetime.date.fromtimestamp(time.time() if now is None else now)
 
 
 def load_state():
@@ -123,6 +129,7 @@ def with_defaults(state):
         m = state["modules"].setdefault(module_id, {})
         m.setdefault("active", True)
         m.setdefault("graduated_at", None)
+        m.setdefault("primer_seen", False)
         m.setdefault("cards", {})
         for template_id in MODULES[module_id].templates:
             m["cards"].setdefault(template_id, new_card())
@@ -141,6 +148,12 @@ def new_card():
     return {"box": 0, "due": 0, "graduated": False, "perfect_run": 0, "seen": 0, "history": []}
 
 
+def jittered(interval):
+    if interval < DAY:
+        return interval
+    return interval * random.uniform(1 - JITTER, 1 + JITTER)
+
+
 def grade_card(card, grade, now=None):
     """Applies one answer to a template's card. grade is perfect, ok or miss.
 
@@ -148,7 +161,7 @@ def grade_card(card, grade, now=None):
     ok       right answer the long way round: stays put, back soon
     miss     back to the first box, again in ten minutes
     """
-    now = now or time.time()
+    now = time.time() if now is None else now
     card["seen"] += 1
     card["history"] = (card["history"] + [[int(now), grade]])[-HISTORY_KEEP:]
     if grade == "perfect":
@@ -158,10 +171,10 @@ def grade_card(card, grade, now=None):
             card["due"] = 0
         else:
             card["box"] += 1
-            card["due"] = now + BOX_DAYS[card["box"]] * DAY
+            card["due"] = now + jittered(BOX_INTERVALS[card["box"]])
     elif grade == "ok":
         card["perfect_run"] = 0
-        card["due"] = now + max(BOX_DAYS[card["box"]] * DAY / 2, 3600)
+        card["due"] = now + max(BOX_INTERVALS[card["box"]] / 2, HOUR)
     else:
         card["perfect_run"] = 0
         card["box"] = 0
@@ -190,7 +203,7 @@ def current_streak(state, now=None):
 
 
 def due_templates(state, module_id, now=None):
-    now = now or time.time()
+    now = time.time() if now is None else now
     cards = state["modules"][module_id]["cards"]
     return [t for t in MODULES[module_id].templates
             if not cards[t]["graduated"] and cards[t]["due"] <= now]
@@ -362,16 +375,85 @@ def keys_duplicate(rng):
     }
 
 
+class Template:
+    """One kind of card: a generator for fresh instances of it, and the lesson
+    that teaches it before it is ever asked."""
+
+    def __init__(self, title, gen, lesson):
+        self.title, self.gen, self.lesson = title, gen, lesson
+
+
 class Module:
-    def __init__(self, title, templates, session_size, run_card):
+    def __init__(self, title, templates, session_size, run_card, teach, primer):
         self.title = title
         self.templates = templates
         self.session_size = session_size
         self.run_card = run_card
+        # teach(template, rng) shows the lesson and walks through one example.
+        self.teach = teach
+        self.primer = primer
+
+
+def edit_lines(phases):
+    """Edits each phase's line in real zsh. Returns [(text, keystrokes)], or
+    None if you bailed out with Ctrl-C."""
+    out = tempfile.NamedTemporaryFile(prefix="srs-vared.", delete=False)
+    out.close()
+    args = [os.path.join(HERE, "srs-vared"), out.name]
+    for p in phases:
+        hint = "%%F{8}%s%%f" % p.get("label", "") if len(phases) > 1 else ""
+        args += [str(p["cursor"]), p["text"], hint]
+    drain_input()
+    subprocess.call(args)
+    with open(out.name) as f:
+        lines = f.read().split("\n")
+    os.unlink(out.name)
+    if "aborted" in lines or len(lines) < 3 * len(phases):
+        return None
+    return [(lines[i * 3], int(lines[i * 3 + 1] or 0)) for i in range(len(phases))]
+
+
+def show_lesson(text):
+    """Lessons are plain text with a few marks: a line starting with '# ' is a
+    heading, and indented lines are examples."""
+    for line in text.strip("\n").splitlines():
+        if line.startswith("# "):
+            print(BOLD(PINK(line[2:])))
+        elif line.startswith("    "):
+            print(CYAN(line))
+        else:
+            print(line)
+    print()
+
+
+def teach_keys(template, rng):
+    """The lesson, then a rehearsal: a fresh line, the exact keys to press,
+    and as many goes as it takes. Nothing here is graded."""
+    show_lesson(template.lesson)
+    card = template.gen(rng)
+    print(BOLD("Try it") + FAINT(" — not graded, take as many goes as you like"))
+    for p in card["phases"]:
+        print("  %s %s" % (FAINT(p.get("label", "goal").ljust(13)), CYAN(p["goal"])))
+    print("  %s %s" % (FAINT("press".ljust(13)),
+                       ("   then   ").join(PINK(render_route(p["route"])) + FAINT(" ⏎") for p in card["phases"])))
+    print()
+    for attempt in range(5):
+        results = edit_lines(card["phases"])
+        if results is None:
+            return
+        wrong = [(p, text) for p, (text, _) in zip(card["phases"], results) if norm(text) != norm(p["goal"])]
+        if not wrong:
+            print(GREEN("  ✓ that's the move") + "\n")
+            return
+        for p, text in wrong:
+            print("  %s you ended with  %s" % (YELLOW("not quite —"), text))
+        print(FAINT("  again, pressing exactly: ") +
+              "   then   ".join(PINK(render_route(p["route"])) for p in card["phases"]) + "\n")
+    print(FAINT("  moving on — it'll come back round") + "\n")
 
 
 def run_keys_card(template, rng):
-    card = template[1](rng)
+    card = template.gen(rng)
     print(card["brief"])
     print()
     for i, p in enumerate(card["phases"]):
@@ -380,26 +462,14 @@ def run_keys_card(template, rng):
     print("  %s %s" % (FAINT("par".ljust(13)), " then ".join(keystrokes(p["par"]) for p in card["phases"])))
     print()
 
-    out = tempfile.NamedTemporaryFile(prefix="srs-vared.", delete=False)
-    out.close()
-    args = [os.path.join(HERE, "srs-vared"), out.name]
-    for i, p in enumerate(card["phases"]):
-        hint = "%%F{8}%s%%f" % p.get("label", "") if len(card["phases"]) > 1 else ""
-        args += [str(p["cursor"]), p["text"], hint]
-    drain_input()
-    subprocess.call(args)
-    with open(out.name) as f:
-        lines = f.read().split("\n")
-    os.unlink(out.name)
-
-    if "aborted" in lines or len(lines) < 3 * len(card["phases"]):
+    results = edit_lines(card["phases"])
+    if results is None:
         print(FAINT("\n  skipped"))
         return None
 
     grades = []
     print()
-    for i, p in enumerate(card["phases"]):
-        text, keys = lines[i * 3], int(lines[i * 3 + 1] or 0)
+    for p, (text, keys) in zip(card["phases"], results):
         right = norm(text) == norm(p["goal"])
         if right and keys <= p["par"]:
             grades.append("perfect")
@@ -419,17 +489,117 @@ def run_keys_card(template, rng):
     return "perfect"
 
 
+KEYS_PRIMER = """
+# Your shell's line editor
+
+At a zsh prompt you are typing into ZLE, zsh's line editor, in its emacs
+keymap. Every key either inserts itself or runs an editing command. ^K means
+hold Control and press K. The same chords work at most prompts — bash, psql,
+irb, node — with one difference, below.
+
+# Moving
+    ^A  to the start of the line      ^E  to the end
+    ^B  back one character            ^F  forward one character
+
+# Killing is cutting, not deleting
+Backspace deletes a character and it is gone. The kill commands cut text into
+the kill buffer — a clipboard private to the shell, separate from ⌘C — and
+^Y yanks (pastes) it back wherever the cursor is.
+
+    ^K  kill from the cursor to the end of the line
+    ^U  kill the whole line, wherever the cursor is
+    ^W  kill the word before the cursor
+    ^Y  yank the most recent kill
+
+# Three facts that make it useful
+· The kill buffer survives from one command line to the next: kill a line,
+  run something else, yank it back.
+· Yanking doesn't use it up. ^Y as many times as you want copies.
+· ^Y gives you only the most recent kill. Kill twice and the second replaces
+  the first.
+
+# zsh is not bash here
+In bash, and anything built on readline, ^U kills from the cursor back to the
+start of the line. In zsh it kills the whole line. These cards teach zsh's.
+"""
+
+LESSON_KILL_TO_END = """
+# ^K — kill to the end of the line
+When the tail of a line is wrong — a flag you don't want, a path that
+completed to the wrong place, too much pasted — put the cursor where the good
+part ends and press ^K. Everything from the cursor on goes, in one keystroke,
+however long it is.
+
+    git log --oneline --graph --all
+                      ↑ cursor
+    ^K   →   git log --oneline
+"""
+
+LESSON_CLEAR_LINE = """
+# ^U — kill the whole line
+To abandon a line and type something else, ^U clears it in one keystroke
+wherever the cursor is — no holding Backspace. The line isn't thrown away:
+it is in the kill buffer, so ^Y would bring it straight back.
+
+    docker compose up --build api
+               ↑ cursor, anywhere
+    ^U   →   (empty — type the new command)
+"""
+
+LESSON_STASH = """
+# ^U … ^Y — stash a line, run something, get it back
+The move ^U and ^Y exist for. You are halfway through a long command and
+realise something has to run first — a fetch, a cd, an export:
+
+    1. ^U        the half-typed line goes into the kill buffer
+    2. type the other command, ⏎ to run it
+    3. ^Y        at the fresh prompt, the long line comes back
+
+It works because the kill buffer survives from one prompt to the next.
+"""
+
+LESSON_TAIL_TO_FRONT = """
+# Moving text: kill, move, yank
+To move part of a line, cut it, move the cursor, paste it. Here an
+environment variable typed after the command belongs in front of it:
+
+    yarn build NODE_ENV=production
+               ↑ cursor at the start of NODE_ENV
+    ^K   kills NODE_ENV=production
+    ^A   jumps to the start of the line
+    ^Y   yanks it there         NODE_ENV=productionyarn build
+    ␠    a space between them   NODE_ENV=production yarn build
+
+The space left over at the end doesn't matter — not to the shell, not to the
+grading.
+"""
+
+LESSON_DUPLICATE = """
+# Yank more than once
+A yank doesn't use the kill up, so one kill gives you as many copies as you
+want — handy whenever a command repeats a path:
+
+    cp config/database.yml
+       ↑ cursor at the start of the path
+    ^K       kills the path
+    ^Y       puts it back
+    ␠ ^Y     a space, and a second copy
+    .bak     then the suffix    cp config/database.yml config/database.yml.bak
+"""
+
 KEYS = Module(
     "Terminal editing",
     {
-        "kill-to-end": ("Kill to end of line", keys_kill_to_end),
-        "clear-line": ("Scrap the line", keys_clear_line),
-        "stash": ("Stash and restore", keys_stash),
-        "tail-to-front": ("Move the tail to the front", keys_tail_to_front),
-        "duplicate": ("Yank twice", keys_duplicate),
+        "kill-to-end": Template("Kill to end of line", keys_kill_to_end, LESSON_KILL_TO_END),
+        "clear-line": Template("Scrap the line", keys_clear_line, LESSON_CLEAR_LINE),
+        "stash": Template("Stash and restore", keys_stash, LESSON_STASH),
+        "tail-to-front": Template("Move the tail to the front", keys_tail_to_front, LESSON_TAIL_TO_FRONT),
+        "duplicate": Template("Yank twice", keys_duplicate, LESSON_DUPLICATE),
     },
     session_size=3,
     run_card=run_keys_card,
+    teach=teach_keys,
+    primer=KEYS_PRIMER,
 )
 
 
@@ -928,24 +1098,108 @@ def diagnose(got, expected):
     return ", ".join(notes) or "different values"
 
 
+SQL_BREAKS = ["CROSS JOIN LATERAL ", "LEFT JOIN LATERAL ", "JOIN ", "FROM ", "WHERE ", "AND ",
+              "GROUP BY ", "ORDER BY ", "LIMIT "]
+
+
+def pretty_sql(sql):
+    """Lays a one-line reference query out over lines, one clause each, with
+    a subquery indented inside its parentheses. Short parenthesised bits — a
+    one-column lateral, a function's arguments — stay on one line."""
+    out, i, level = [], 0, 0
+    stack = []  # per open paren: whether it was laid out over lines
+    while i < len(sql):
+        c = sql[i]
+        if c == "(":
+            depth, j = 1, i + 1
+            while j < len(sql) and depth:
+                depth += {"(": 1, ")": -1}.get(sql[j], 0)
+                j += 1
+            inner = sql[i + 1:j - 1]
+            big = inner.startswith("SELECT") and len(inner) > 50
+            stack.append(big)
+            if big:
+                level += 1
+                out.append("(\n" + "  " * level)
+            else:
+                out.append("(")
+            i += 1
+            continue
+        if c == ")":
+            if stack and stack.pop():
+                level -= 1
+                out.append("\n" + "  " * level + ")")
+            else:
+                out.append(")")
+            i += 1
+            continue
+        if c == " " and not any(not big for big in stack):
+            kw = next((k for k in SQL_BREAKS if sql.startswith(k, i + 1)), None)
+            if kw:
+                out.append("\n" + "  " * level + ("  " if kw == "AND " else "") + kw)
+                i += 1 + len(kw)
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def wrapped(text, width=96):
+    """Prompts are generated sentences, too long for a terminal line; wrap
+    them at word boundaries rather than let the terminal cut words."""
+    import textwrap
+    return "\n".join(textwrap.fill(line, width) if line else "" for line in text.splitlines())
+
+
+def scenario_tables(sc):
+    return [name + "\n" + duck(sc["db"], "SELECT * FROM %s" % name, fmt="-box")[0].rstrip()
+            for name, _, _ in sc["tables"]]
+
+
+def teach_lateral(template, rng):
+    """The lesson, then a worked example on freshly generated data: the
+    tables, the question, the query that answers it and what it returns."""
+    show_lesson(template.lesson)
+    if not duckdb_path():
+        print(RED("duckdb is not installed — brew install duckdb"))
+        return
+    drain_input()
+    if ask(FAINT("[Return] see a worked example   [s] skip it  "), ["example", "skip"]) == "skip":
+        return
+    workdir = os.path.join(HOME, "work")
+    os.makedirs(workdir, exist_ok=True)
+    sc = make_scenario(template.gen, rng, workdir)
+    print()
+    print(BOLD("Worked example") + FAINT(" — the real card will have different data"))
+    print(wrapped(sc["prompt"]))
+    print()
+    for block in scenario_tables(sc):
+        print(FAINT(block))
+        print()
+    print(GREEN(pretty_sql(sc["solution"])))
+    print()
+    print(CYAN(duck(sc["db"], sc["solution"], fmt="-box")[0].rstrip()))
+    print()
+    print(FAINT("why: ") + sc["why"])
+    print()
+
+
 def run_lateral_card(template, rng):
     if not duckdb_path():
         print(RED("duckdb is not installed — brew install duckdb"))
         return None
     workdir = os.path.join(HOME, "work")
     os.makedirs(workdir, exist_ok=True)
-    sc = make_scenario(template[1], rng, workdir)
+    sc = make_scenario(template.gen, rng, workdir)
 
-    shown = []
-    for name, _, _ in sc["tables"]:
-        shown.append(name + "\n" + duck(sc["db"], "SELECT * FROM %s" % name, fmt="-box")[0].rstrip())
+    shown = scenario_tables(sc)
     expected_box = duck(sc["db"], sc["solution"], fmt="-box")[0].rstrip()
 
     def as_comment(text):
         return "\n".join(("-- " + line).rstrip() for line in text.splitlines())
 
     header = "\n\n".join([
-        as_comment(sc["title"] + "\n\n" + sc["prompt"] + "\nUse LATERAL. Save and quit to run it."),
+        as_comment(sc["title"] + "\n\n" + wrapped(sc["prompt"], 90) + "\nUse LATERAL. Save and quit to run it."),
         as_comment("\n\n".join(shown)),
         as_comment("expected\n" + expected_box),
     ])
@@ -954,7 +1208,7 @@ def run_lateral_card(template, rng):
         f.write(header + "\n\n")
 
     print(BOLD(sc["title"]))
-    print(sc["prompt"])
+    print(wrapped(sc["prompt"]))
     print()
     for block in shown:
         print(FAINT(block))
@@ -967,11 +1221,16 @@ def run_lateral_card(template, rng):
     used_lateral_late = False
     while True:
         drain_input()
-        choice = ask(FAINT("[Return] write the query   [s] show the answer   [q] quit  "), ["write", "show", "quit"])
+        choice = ask(FAINT("[Return] write the query   [l] the lesson   [s] show the answer   [q] quit  "),
+                     ["write", "lesson", "show", "quit"])
         if choice == "quit":
             return None
+        if choice == "lesson":
+            print()
+            show_lesson(template.lesson)
+            continue
         if choice == "show":
-            print("\n" + GREEN(sc["solution"]))
+            print("\n" + GREEN(pretty_sql(sc["solution"])))
             print("\n" + FAINT("why: ") + sc["why"])
             return "miss"
         subprocess.call(editor_command(path))
@@ -984,6 +1243,7 @@ def run_lateral_card(template, rng):
         got, err = duck(sc["db"], body)
         clear()
         print(BOLD(sc["title"]) + FAINT("  attempt %d" % attempts))
+        print(CYAN("expected"))
         print(CYAN(expected_box))
         print()
         if err:
@@ -991,6 +1251,7 @@ def run_lateral_card(template, rng):
             continue
         if got != sc["expected"]:
             mine, _ = duck(sc["db"], body, fmt="-box")
+            print("yours")
             print((mine or "").rstrip())
             print(RED("✗ " + diagnose(got, sc["expected"])))
             continue
@@ -1004,18 +1265,162 @@ def run_lateral_card(template, rng):
         return "perfect" if attempts == 1 and not used_lateral_late else "ok"
 
 
+LATERAL_PRIMER = """
+# LATERAL: a subquery that can see the row beside it
+An ordinary subquery in FROM is worked out once, on its own — it cannot refer
+to the tables next to it. LATERAL lifts that: the subquery runs once for every
+row to its left, and can use that row's columns. Read it as a for-each loop.
+
+    SELECT c.name, recent.placed_on
+    FROM customers c
+    CROSS JOIN LATERAL (
+      SELECT o.placed_on FROM orders o
+      WHERE o.customer_id = c.id      ← c is visible in here
+      ORDER BY o.placed_on DESC
+      LIMIT 3                         ← so this limit is per customer
+    ) recent
+
+Reach for it when what you need per row is itself a query: the top N per
+group, the latest row with all its columns, the value in effect on a date, an
+aggregate over related rows, or one row expanded into many by a function.
+
+# Keeping or dropping rows with nothing to join
+    CROSS JOIN LATERAL (…) x           no rows from the subquery → the row is dropped
+    LEFT JOIN LATERAL (…) x ON true    no rows → the row stays, with NULLs
+ON true, because the matching already happened inside the subquery. An
+aggregate subquery (count, max, …) always returns exactly one row, so there
+CROSS JOIN keeps everything.
+
+# Where it works
+Postgres, DuckDB, MySQL 8.0.14+: yes. SQL Server spells it CROSS APPLY and
+OUTER APPLY. SQLite: no — a correlated subquery per column is the nearest.
+DuckDB accepts the subquery without the keyword; write it anyway, because
+Postgres won't.
+"""
+
+LESSON_TOPN = """
+# Top N per group
+JOIN … ORDER BY … LIMIT 3 limits the whole result: three rows in total. Move
+the ORDER BY and LIMIT inside a lateral subquery and they apply per parent:
+
+    SELECT p.name, x.placed_on
+    FROM customers p
+    CROSS JOIN LATERAL (
+      SELECT placed_on FROM orders
+      WHERE orders.customer_id = p.id
+      ORDER BY placed_on DESC
+      LIMIT 3
+    ) x
+    ORDER BY p.name, x.placed_on DESC
+
+A parent with fewer than N gets what it has. To keep a parent with none, use
+LEFT JOIN LATERAL … ON true. (row_number() OVER (PARTITION BY …) in a
+subquery does the same job; the lateral says it more directly.)
+"""
+
+LESSON_LATEST = """
+# The latest row, with all its columns
+GROUP BY with max(finished_at) finds when the latest build was — but every
+aggregate is worked out on its own, so max(status) is the alphabetically last
+status, not the latest build's. To keep the whole row, pick the row:
+
+    SELECT r.name, b.finished_at, b.status
+    FROM repos r
+    LEFT JOIN LATERAL (
+      SELECT finished_at, status FROM builds
+      WHERE builds.repo_id = r.id
+      ORDER BY finished_at DESC
+      LIMIT 1
+    ) b ON true
+
+Ids are not a clock: order by the timestamp, not by id.
+"""
+
+LESSON_ASOF = """
+# As of then: the value in effect on a date
+Prices, rates and salaries change over time and are stored one row per
+change, with the date it took effect. The one that applied to an event is the
+latest change on or before the event's date — a ranking that depends on the
+outer row, which is exactly what a lateral subquery can do:
+
+    SELECT s.id, s.sold_on, p.price
+    FROM sales s
+    LEFT JOIN LATERAL (
+      SELECT price FROM prices
+      WHERE prices.product = s.product
+        AND prices.effective_on <= s.sold_on    ← on or before
+      ORDER BY prices.effective_on DESC
+      LIMIT 1
+    ) p ON true                                 ← keeps a sale from before any price
+
+<= catches a change that lands on the day itself; < would still use the old one.
+"""
+
+LESSON_RANGES = """
+# One row per value in a range
+A function that returns rows, like generate_series, can sit in a LATERAL
+position and take its arguments from the row: each row is expanded into one
+output row per value.
+
+    SELECT g.week, o.engineer
+    FROM on_call o
+    CROSS JOIN LATERAL generate_series(o.first_week, o.last_week) AS g(week)
+    ORDER BY g.week, o.engineer
+
+generate_series includes both ends; range() stops one short. A range that
+runs backwards produces no rows, so CROSS JOIN drops it. To count per value
+instead of listing, add GROUP BY g.week and count(*).
+"""
+
+LESSON_PRIOR = """
+# Looking back from each row
+A lateral subquery can aggregate over other rows relative to this one — here,
+the same customer's earlier orders:
+
+    SELECT o.id, o.placed_on, h.prior, h.previous
+    FROM orders o
+    CROSS JOIN LATERAL (
+      SELECT count(*) AS prior, max(q.placed_on) AS previous
+      FROM orders q
+      WHERE q.customer = o.customer
+        AND q.placed_on < o.placed_on     ← strictly earlier, so not itself
+    ) h
+
+An aggregate always returns one row, so CROSS JOIN keeps first orders too:
+count() gives 0 and max() gives NULL. (count(*) OVER (…) and lag() can do this
+particular one; the lateral works for any condition you can write.)
+"""
+
+LESSON_DERIVED = """
+# Name a value once, use it again
+Standard SQL — Postgres included — won't let WHERE use an alias defined in
+SELECT, so computed values get written out twice. A lateral subquery with no
+FROM turns them into real columns, and each can build on the one before:
+
+    SELECT t.sku, g.gross, n.net
+    FROM line_items t
+    CROSS JOIN LATERAL (SELECT t.qty * t.unit_price AS gross) g
+    CROSS JOIN LATERAL (SELECT g.gross - t.discount AS net) n
+    WHERE n.net > 100
+    ORDER BY n.net DESC
+
+Mind the wording: "more than" is >, "at least" is >=.
+"""
+
 LATERAL = Module(
     "Lateral joins",
     {
-        "top-n": ("Top N per group", lateral_topn),
-        "latest-row": ("Latest row, whole", lateral_latest),
-        "as-of": ("As-of lookup", lateral_asof),
-        "ranges": ("Expand ranges", lateral_ranges),
-        "prior": ("Looking back", lateral_prior),
-        "derived": ("Name it once", lateral_derived),
+        "top-n": Template("Top N per group", lateral_topn, LESSON_TOPN),
+        "latest-row": Template("Latest row, whole", lateral_latest, LESSON_LATEST),
+        "as-of": Template("As-of lookup", lateral_asof, LESSON_ASOF),
+        "ranges": Template("Expand ranges", lateral_ranges, LESSON_RANGES),
+        "prior": Template("Looking back", lateral_prior, LESSON_PRIOR),
+        "derived": Template("Name it once", lateral_derived, LESSON_DERIVED),
     },
     session_size=1,
     run_card=run_lateral_card,
+    teach=teach_lateral,
+    primer=LATERAL_PRIMER,
 )
 
 MODULES = {"keys": KEYS, "lateral": LATERAL}
@@ -1031,9 +1436,9 @@ def cmd_status(args):
         m = state["modules"][module_id]
         cards = m["cards"]
         templates = []
-        for tid, (title, _) in module.templates.items():
+        for tid, template in module.templates.items():
             c = cards[tid]
-            templates.append({"id": tid, "title": title, "box": c["box"], "graduated": c["graduated"],
+            templates.append({"id": tid, "title": template.title, "box": c["box"], "graduated": c["graduated"],
                               "due": c["due"], "perfect_run": c["perfect_run"], "seen": c["seen"]})
         upcoming = [c["due"] for c in cards.values() if not c["graduated"] and c["due"] > now]
         modules.append({
@@ -1109,32 +1514,36 @@ def cmd_reset(args):
     return 0
 
 
-def gate(module, count):
+def gate(module, count, fresh):
     """The first screen of a popup. It has just taken the keyboard from
     whatever you were doing, so anything typed in the first moment is
     discarded before it asks."""
     clear()
-    print(PINK("◈ ") + BOLD("Quiz time") + FAINT(" · ") + module.title + FAINT(" · %d card%s" % (count, "" if count == 1 else "s")))
+    print(PINK("◈ ") + BOLD("Quiz time") + FAINT(" · ") + module.title
+          + FAINT(" · %d card%s" % (count, "" if count == 1 else "s"))
+          + (YELLOW(" · 1 new, with a lesson first") if fresh else ""))
     print()
     time.sleep(0.8)
     drain_input()
     return ask(FAINT("[Return] start   [s] snooze an hour   [q] not now  "), ["start", "snooze", "quit"])
 
 
-def cmd_run(args):
-    """One quiz at a time: the lock is claimed before anything is shown, so a
-    quiz still sitting on its first screen counts as open too."""
-    if not claim_lock():
-        print("a quiz is already open")
-        return 3
-    signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))
-    try:
-        return run_session(args)
-    finally:
+def one_at_a_time(fn):
+    """One quiz window at a time: the lock is claimed before anything is
+    shown, so a quiz still sitting on its first screen counts as open too."""
+    def locked(args):
+        if not claim_lock():
+            print("a quiz is already open")
+            return 3
+        signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))
         try:
-            os.unlink(LOCK_PATH)
-        except OSError:
-            pass
+            return fn(args)
+        finally:
+            try:
+                os.unlink(LOCK_PATH)
+            except OSError:
+                pass
+    return locked
 
 
 def claim_lock():
@@ -1174,15 +1583,14 @@ def run_session(args):
         module_id = random.choice(choices)
     module = MODULES[module_id]
 
-    due = due_templates(state, module_id, now)
-    if not due:
+    if not due_templates(state, module_id, now):
         practice = True
-    pool = due if (due and not practice) else list(module.templates)
-    random.shuffle(pool)
-    session = pool[:module.session_size]
+    session = choose_session(state, module_id, practice, now)
+    cards = state["modules"][module_id]["cards"]
+    fresh = any(cards[t]["seen"] == 0 for t in session)
 
     if popup:
-        choice = gate(module, len(session))
+        choice = gate(module, len(session), fresh)
         if choice == "snooze":
             cmd_snooze(["60"])
             return 0
@@ -1191,14 +1599,33 @@ def run_session(args):
 
     rng = random.Random()
     tally = []
+    if not state["modules"][module_id]["primer_seen"]:
+        clear()
+        show_lesson(module.primer)
+        state["modules"][module_id]["primer_seen"] = True
+        save_state(state)
+        drain_input()
+        if ask(FAINT("[Return] on to the first card   [q] stop here  "), ["next", "quit"]) == "quit":
+            return 0
     for i, tid in enumerate(session):
         state = load_state()
         card = state["modules"][module_id]["cards"][tid]
         template = module.templates[tid]
+        header = (PINK("◈ ") + BOLD(module.title) + FAINT(" · %d/%d · %s   " % (i + 1, len(session), template.title))
+                  + meter(card["box"], card["graduated"])
+                  + (FAINT("  practice — progress unchanged") if practice else ""))
+        # Box 0 is a card you haven't learned yet, or just missed: it is
+        # taught again before it is asked.
+        if card["box"] == 0:
+            clear()
+            print(header + YELLOW("  new" if card["seen"] == 0 else "  again"))
+            print()
+            module.teach(template, rng)
+            drain_input()
+            if ask(FAINT("[Return] now the real one   [q] stop here  "), ["next", "quit"]) == "quit":
+                break
         clear()
-        mode = FAINT("  practice — progress unchanged") if practice else ""
-        print(PINK("◈ ") + BOLD(module.title) + FAINT(" · %d/%d · %s   " % (i + 1, len(session), template[0]))
-              + meter(card["box"], card["graduated"]) + mode)
+        print(header)
         print()
         grade = module.run_card(template, rng)
         if grade is None:
@@ -1227,8 +1654,64 @@ def run_session(args):
     return 0
 
 
-COMMANDS_TABLE = {"status": cmd_status, "pick": cmd_pick, "run": cmd_run, "snooze": cmd_snooze,
-                  "toggle": cmd_toggle, "reset": cmd_reset}
+def choose_session(state, module_id, practice, now=None):
+    """Reviews first, and at most one card you have never seen — new
+    material arrives one lesson at a time. Practice draws from everything."""
+    module = MODULES[module_id]
+    if practice:
+        pool = list(module.templates)
+        random.shuffle(pool)
+        return pool[:module.session_size]
+    cards = state["modules"][module_id]["cards"]
+    due = due_templates(state, module_id, now)
+    reviews = [t for t in due if cards[t]["seen"] > 0]
+    fresh = [t for t in due if cards[t]["seen"] == 0]
+    random.shuffle(reviews)
+    session = reviews[:module.session_size]
+    if len(session) < module.session_size and fresh:
+        # The new one goes first, while attention is fresh.
+        session.insert(0, fresh[0])
+    return session
+
+
+def learn_session(args):
+    """srs learn MODULE [CARD] — the primer and every lesson, with the
+    rehearsals and worked examples, and nothing graded."""
+    if not args or args[0] not in MODULES:
+        print("srs learn MODULE [CARD] — modules: %s" % ", ".join(MODULES))
+        return 2
+    module = MODULES[args[0]]
+    tids = list(module.templates)
+    if len(args) > 1:
+        if args[1] not in module.templates:
+            print("cards in %s: %s" % (args[0], ", ".join(tids)))
+            return 2
+        tids = [args[1]]
+    rng = random.Random()
+    clear()
+    show_lesson(module.primer)
+    state = load_state()
+    state["modules"][args[0]]["primer_seen"] = True
+    save_state(state)
+    for i, tid in enumerate(tids):
+        drain_input()
+        if ask(FAINT("[Return] %s   [q] stop here  " % ("next: " + module.templates[tid].title)),
+               ["next", "quit"]) == "quit":
+            return 0
+        clear()
+        print(PINK("◈ ") + BOLD(module.title) + FAINT(" · lesson %d/%d" % (i + 1, len(tids))))
+        print()
+        module.teach(module.templates[tid], rng)
+    drain_input()
+    ask(FAINT("[Return] done  "), ["done"])
+    return 0
+
+
+cmd_run = one_at_a_time(run_session)
+cmd_learn = one_at_a_time(learn_session)
+
+COMMANDS_TABLE = {"status": cmd_status, "pick": cmd_pick, "run": cmd_run, "learn": cmd_learn,
+                  "snooze": cmd_snooze, "toggle": cmd_toggle, "reset": cmd_reset}
 
 
 def main(argv):

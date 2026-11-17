@@ -52,14 +52,39 @@ output, the scenario is regenerated. A correct query without the `LATERAL`
 keyword is sent back — DuckDB lets a subquery see earlier tables without it,
 Postgres doesn't.
 
+## Teach, rehearse, quiz
+
+Nothing is asked before it has been taught. The first time a module comes up
+you get its **primer** — for terminal editing, what the line editor is, moving
+the cursor, killing versus deleting, the kill buffer, and where zsh and bash
+differ; for lateral joins, what `LATERAL` means, `CROSS` versus `LEFT … ON
+true`, and which databases have it.
+
+Then every card still in the first box — new, or just missed — is preceded by
+its **lesson**: the idea and an annotated example, then a rehearsal. A
+terminal card's rehearsal is a fresh line in real zsh with the exact keys to
+press, ungraded, until you've done it. A lateral card's is a worked example on
+freshly generated data: the tables, the formatted query, what it returns, and
+why. On a lateral card, `l` brings the lesson back mid-attempt.
+
+New material arrives one card at a time: a session brings reviews first and at
+most one card you haven't seen. `srs learn keys` (or **Learn** in a module's
+menu) walks through the primer and every lesson whenever you want, ungraded.
+
 ## Progress
 
 Per card template, in Leitner boxes:
 
 - **perfect** (par keystrokes, or a correct query first try) — up a box; next
-  review in 1, 3, 7, 14, then 30 days
+  review a few hours later the same day, then tomorrow, in about 3 days, a
+  week, then two weeks
 - **right the long way** — stays in its box, back sooner
 - **miss** — back to the first box, again in ten minutes
+
+Popups only come when a card is due, so they thin out by themselves as cards
+climb: several a day for new material, every day or two at first, then a
+couple of times a week, weekly, fortnightly. Intervals of a day or more are
+jittered ±10% so cards learned together drift apart.
 
 A perfect answer from the last box graduates the card; a module graduates when
 all of its cards have, and stops popping up. The daily streak counts days with
@@ -85,12 +110,13 @@ works. Click the **Focus** row in the menu to re-check.
 ```sh
 srs status            # streak, due counts, a meter per card
 srs run keys          # quiz now (or: srs run lateral, srs run --practice keys)
+srs learn lateral     # the primer and every lesson; srs learn lateral as-of for one
 srs snooze 90         # hold popups for 90 minutes
 ```
 
 The menu bar item (`hammerspoon/lua/srs.lua`) has the same, plus popup
-frequency — often (20–45 min), every hour or two (default), a few times a day,
-or never.
+frequency — every hour or so, every few hours (default), twice a day, or
+never — and **Only during the work week** (on by default: Mon–Fri, 9:00–18:00).
 
 ## Install
 

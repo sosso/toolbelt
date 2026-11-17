@@ -21,12 +21,18 @@ local config = {
   focusOutput = (os.getenv("TMPDIR") or "/tmp/") .. "srs-focus.txt",
   frequencyKey = "hammerspoon.srs.frequency",
   defaultFrequency = "normal",
+  -- How often a popup *may* come. One only comes when a card is due, so as
+  -- cards climb from hours to weeks between reviews the popups thin out by
+  -- themselves; this sets the pace while new material is being learned.
   frequencies = {
-    { key = "often", label = "Often", min = 20, max = 45 },
-    { key = "normal", label = "Every hour or two", min = 45, max = 120 },
-    { key = "rare", label = "A few times a day", min = 120, max = 240 },
+    { key = "often", label = "Every hour or so", min = 45, max = 90 },
+    { key = "normal", label = "Every few hours", min = 120, max = 180 },
+    { key = "rare", label = "Twice a day", min = 240, max = 300 },
     { key = "off", label = "Never — only when I ask" },
   },
+  -- Popups stay inside the working week: Monday to Friday, these hours.
+  workdayKey = "hammerspoon.srs.workdayOnly",
+  workday = { startHour = 9, endHour = 18, days = { [2] = true, [3] = true, [4] = true, [5] = true, [6] = true } },
   -- Seconds without a keypress or mouse move before you count as away.
   idleLimit = 300,
   retryHeld = 300,
@@ -58,6 +64,29 @@ local function frequency()
     if f.key == key then return f end
   end
   return config.frequencies[2]
+end
+
+local function workdayOnly()
+  return hs.settings.get(config.workdayKey) ~= false
+end
+
+local function inWorkday(epoch)
+  local t = os.date("*t", epoch)
+  local w = config.workday
+  return w.days[t.wday] and t.hour >= w.startHour and t.hour < w.endHour
+end
+
+-- Seconds from now until the working week next opens (0 if it is open).
+local function untilWorkday()
+  local now = os.time()
+  if not workdayOnly() or inWorkday(now) then return 0 end
+  local t = os.date("*t", now)
+  for d = 0, 7 do
+    local start = os.time({ year = t.year, month = t.month, day = t.day + d,
+      hour = config.workday.startHour, min = 0, sec = 0 })
+    if start > now and inWorkday(start) then return start - now end
+  end
+  return 3600
 end
 
 local function untilText(epoch)
@@ -153,7 +182,7 @@ local function launch(moduleId, opts)
   if (state.status and state.status.running) or os.time() - lastLaunch < LAUNCH_SETTLE then return end
   lastLaunch = os.time()
 
-  local command = config.srs .. " run"
+  local command = config.srs .. (opts.learn and " learn" or " run")
   if moduleId then command = command .. " " .. moduleId end
   if opts.popup then command = command .. " --popup" end
   if opts.practice then command = command .. " --practice" end
@@ -204,6 +233,12 @@ local function tryPopup()
   if f.key == "off" then
     state.nextAt, state.held = nil, nil
     return updateTitle()
+  end
+
+  local closed = untilWorkday()
+  if closed > 0 then
+    -- Opening time plus a little, so it doesn't land on the stroke of nine.
+    return hold("outside work hours", closed + math.random(10, 60) * 60)
   end
 
   refresh(function()
@@ -281,6 +316,14 @@ local function moduleMenu(m, p)
     })
   end
   table.insert(rows, { title = "-" })
+  table.insert(rows, {
+    title = util.row(48, config.rowSize, {
+      { "  Learn", { color = p.cyan } },
+      { "", gap = true },
+      { "primer and every lesson  ", { color = p.faint } },
+    }),
+    fn = function() launch(m.id, { learn = true }) end,
+  })
   table.insert(rows, {
     title = util.row(48, config.rowSize, { { "  Quiz now", { color = p.cyan } } }),
     fn = function() launch(m.id) end,
@@ -421,6 +464,19 @@ local function buildMenu()
       { frequency().label .. "  ", { color = p.faint } },
     }),
     menu = frequencyMenu(p),
+  })
+  local w = config.workday
+  table.insert(items, {
+    title = util.row(W, S, {
+      { "  Only during the work week", { color = p.cyan } },
+      { "", gap = true },
+      { string.format("Mon–Fri %d:00–%d:00  ", w.startHour, w.endHour), { color = p.faint } },
+    }),
+    checked = workdayOnly(),
+    fn = function()
+      hs.settings.set(config.workdayKey, not workdayOnly())
+      scheduleFresh()
+    end,
   })
   local focusNote = state.focusError and ("can't tell — " .. state.focusError)
     or (state.focus == nil and "not checked yet")

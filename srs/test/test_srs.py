@@ -66,7 +66,8 @@ def type_into_vared(card, typing_gap=0.04):
 
 class KeysCards(unittest.TestCase):
     def test_par_route_reaches_the_goal_in_par(self):
-        for tid, (title, gen) in srs.KEYS.templates.items():
+        for tid, t in srs.KEYS.templates.items():
+            gen = t.gen
             for seed in range(6):
                 card = gen(random.Random(seed))
                 with self.subTest(template=tid, seed=seed):
@@ -76,13 +77,15 @@ class KeysCards(unittest.TestCase):
                         self.assertEqual(keys, p["par"])
 
     def test_cursor_starts_inside_the_line(self):
-        for tid, (_, gen) in srs.KEYS.templates.items():
+        for tid, t in srs.KEYS.templates.items():
+            gen = t.gen
             for seed in SEEDS:
                 for p in gen(random.Random(seed))["phases"]:
                     self.assertTrue(0 <= p["cursor"] <= len(p["text"]), (tid, seed))
 
     def test_the_goal_is_never_already_done(self):
-        for tid, (_, gen) in srs.KEYS.templates.items():
+        for tid, t in srs.KEYS.templates.items():
+            gen = t.gen
             for seed in SEEDS:
                 for p in gen(random.Random(seed))["phases"]:
                     self.assertNotEqual(srs.norm(p["text"]), srs.norm(p["goal"]), (tid, seed))
@@ -97,7 +100,8 @@ class LateralCards(unittest.TestCase):
         shutil.rmtree(self.dir)
 
     def test_every_wrong_answer_runs_and_misses(self):
-        for tid, (_, gen) in srs.LATERAL.templates.items():
+        for tid, t in srs.LATERAL.templates.items():
+            gen = t.gen
             for seed in SEEDS:
                 with self.subTest(template=tid, seed=seed):
                     sc = srs.make_scenario(gen, random.Random(seed), self.dir)
@@ -109,18 +113,57 @@ class LateralCards(unittest.TestCase):
                         self.assertNotEqual(rows, sc["expected"], w)
 
     def test_scenarios_vary(self):
-        for tid, (_, gen) in srs.LATERAL.templates.items():
+        for tid, t in srs.LATERAL.templates.items():
+            gen = t.gen
             outputs = set()
             for seed in range(8):
                 sc = srs.make_scenario(gen, random.Random(seed), self.dir)
                 outputs.add(repr(sc["expected"]))
             self.assertGreaterEqual(len(outputs), 7, tid)
 
+    def test_pretty_printing_keeps_the_query_the_same(self):
+        for tid, t in srs.LATERAL.templates.items():
+            for seed in range(5):
+                with self.subTest(template=tid, seed=seed):
+                    sc = srs.make_scenario(t.gen, random.Random(seed), self.dir)
+                    pretty = srs.pretty_sql(sc["solution"])
+                    self.assertGreater(pretty.count("\n"), 2)
+                    self.assertEqual("".join(pretty.split()), "".join(sc["solution"].split()))
+                    self.assertEqual(srs.duck(sc["db"], pretty)[0], sc["expected"])
+
     def test_multiple_statements_are_refused(self):
         sc = srs.make_scenario(srs.lateral_ranges, random.Random(1), self.dir)
         rows, err = srs.duck(sc["db"], "SELECT 1; SELECT 2")
         self.assertIsNone(rows)
         self.assertIn("one statement", err)
+
+
+class Lessons(unittest.TestCase):
+    def test_every_card_and_module_has_teaching(self):
+        for module_id, module in srs.MODULES.items():
+            self.assertTrue(module.primer.strip(), module_id)
+            for tid, t in module.templates.items():
+                self.assertTrue(t.lesson.strip().startswith("# "), tid)
+
+    def test_a_session_brings_at_most_one_new_card(self):
+        state = srs.with_defaults({})
+        for module_id, module in srs.MODULES.items():
+            for _ in range(10):
+                session = srs.choose_session(state, module_id, practice=False, now=1)
+                self.assertEqual(len(session), 1, module_id)
+
+    def test_reviews_come_before_new_cards(self):
+        state = srs.with_defaults({})
+        cards = state["modules"]["keys"]["cards"]
+        for tid in ["kill-to-end", "clear-line", "stash"]:
+            cards[tid]["seen"] = 1
+        session = srs.choose_session(state, "keys", practice=False, now=1)
+        self.assertEqual(sorted(session), ["clear-line", "kill-to-end", "stash"])
+        cards["stash"]["due"] = 10 ** 12
+        session = srs.choose_session(state, "keys", practice=False, now=1)
+        self.assertEqual(len(session), 3)
+        self.assertEqual(sum(1 for t in session if cards[t]["seen"] == 0), 1)
+        self.assertEqual(cards[session[0]]["seen"], 0)
 
 
 class Scheduling(unittest.TestCase):
@@ -133,6 +176,18 @@ class Scheduling(unittest.TestCase):
             now = card["due"]
         srs.grade_card(card, "perfect", now)
         self.assertTrue(card["graduated"])
+
+    def test_perfects_climb_from_hours_to_weeks(self):
+        card = srs.new_card()
+        now = 0
+        gaps = []
+        for _ in range(srs.LAST_BOX):
+            srs.grade_card(card, "perfect", now)
+            gaps.append(card["due"] - now)
+            now = card["due"]
+        self.assertEqual(gaps[0], 3 * srs.HOUR)
+        for gap, days in zip(gaps[1:], [1, 3, 7, 14]):
+            self.assertAlmostEqual(gap / srs.DAY, days, delta=days * srs.JITTER + 1e-9)
 
     def test_a_miss_sends_it_back_to_the_start(self):
         card = srs.new_card()
